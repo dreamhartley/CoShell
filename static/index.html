@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <script>(()=>{const themes=['dark','light','fresh','ocean','midnight'],saved=localStorage.getItem('webssh-theme'),theme=themes.includes(saved)?saved:(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.dataset.theme=theme;document.documentElement.dataset.themeMode=['dark','midnight'].includes(theme)?'dark':'light'})()</script>
+  <title>SSH Terminal</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+  <link rel="stylesheet" href="/static/vendor/codemirror.css">
+  <link rel="stylesheet" href="/static/vendor/codemirror-material-darker.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="sidebar-toggle" class="icon-btn" title="切换侧栏">☰</button>
+    <div class="brand"><span class="brand-mark">›_</span><strong>SSH Terminal</strong></div>
+    <div class="top-actions">
+      <span id="connection-count" class="muted">0 个连接</span>
+      <button id="settings-btn" class="soft-btn">⚙ 设置</button>
+    </div>
+  </header>
+  <main class="workspace">
+    <aside id="sidebar" class="sidebar">
+      <section id="system-info" class="system-info" aria-label="远端系统信息">
+        <div class="system-ip-row"><span>IP</span><strong id="system-ip">--</strong><button id="copy-system-ip" class="copy-link" type="button" disabled>复制</button></div>
+        <button id="system-info-toggle" class="system-info-title" type="button" aria-expanded="true">系统信息</button>
+        <div id="system-info-body" class="system-info-body">
+          <div class="system-line">运行 <span id="system-uptime">--</span></div>
+          <div class="system-line">负载 <span id="system-load">--, --, --</span></div>
+          <div class="metric-row"><span>CPU</span><div class="metric-track"><i id="cpu-bar"></i><span id="cpu-value">--</span></div></div>
+          <div class="metric-row"><span>内存</span><div class="metric-track memory"><i id="memory-bar"></i><span id="memory-value">--</span><em id="memory-detail">--/--</em></div></div>
+          <div class="metric-row"><span>交换</span><div class="metric-track"><i id="swap-bar"></i><span id="swap-value">--</span><em id="swap-detail">--/--</em></div></div>
+        </div>
+      </section>
+      <nav class="side-tabs" aria-label="工具">
+        <button class="side-tab active" data-panel="sftp">文件</button>
+        <button class="side-tab" data-panel="shortcuts">指令</button>
+        <button class="side-tab" data-panel="servers">主机</button>
+      </nav>
+      <section id="panel-sftp" class="side-panel active">
+        <div class="panel-head"><strong>SFTP</strong><button id="sftp-refresh" class="icon-btn" title="刷新">↻</button></div>
+        <div class="path-row"><button id="sftp-up" class="icon-btn">↑</button><input id="sftp-path" value="." aria-label="远程路径"><button id="sftp-go" class="soft-btn">前往</button></div>
+        <div class="file-actions"><button id="upload-btn">上传</button><button id="new-file-btn">新建文件</button><button id="mkdir-btn">新建目录</button><button id="batch-btn" class="hidden">批量操作</button><input id="upload-input" type="file" multiple hidden></div>
+        <div id="file-list" class="file-list drop-zone"><div class="empty">连接 SSH 后浏览文件</div></div>
+      </section>
+      <section id="panel-shortcuts" class="side-panel">
+        <div class="panel-head"><strong>快捷指令</strong><button id="shortcut-add" class="icon-btn">＋</button></div>
+        <input id="shortcut-search" class="search" placeholder="搜索指令">
+        <div id="shortcut-list" class="card-list"></div>
+      </section>
+      <section id="panel-servers" class="side-panel">
+        <div class="panel-head"><strong>保存的服务器</strong><button id="server-add" class="icon-btn">＋</button></div>
+        <input id="server-search" class="search" placeholder="搜索服务器">
+        <div id="server-list" class="card-list"></div>
+      </section>
+    </aside>
+    <div id="resizer" class="resizer"></div>
+    <section class="terminal-area">
+      <div class="terminal-tabs-bar">
+        <div id="terminal-tabs" class="terminal-tabs"></div>
+        <button id="new-tab" class="new-tab" title="新建连接">＋</button>
+      </div>
+      <div id="terminals" class="terminals">
+        <div id="welcome" class="welcome"><div class="welcome-icon">›_</div><h1>轻量 SSH 终端</h1><p>新建连接，或从左侧选择保存的服务器</p><button id="welcome-connect" class="primary">新建连接</button></div>
+        <section id="quick-connect" class="quick-connect hidden" aria-labelledby="quick-connect-title">
+          <div class="quick-connect-card">
+            <div class="quick-connect-head">
+              <div><span class="quick-connect-kicker">SSH 工作区</span><h2 id="quick-connect-title">快速连接</h2></div>
+              <button id="quick-connect-close" class="quick-connect-close" type="button" aria-label="关闭快速连接">返回终端</button>
+            </div>
+            <button id="quick-connect-new" class="quick-connect-new" type="button">➕ 新建连接</button>
+            <div class="quick-connect-label"><span>最近连接</span><span>服务器地址</span></div>
+            <div id="quick-connect-list" class="quick-connect-list"></div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="connect-dialog">
+    <form id="connect-form" class="dialog-form">
+      <div class="dialog-title"><h2>新建 SSH 连接</h2><button type="button" class="dialog-close icon-btn">×</button></div>
+      <input type="hidden" name="server_id">
+      <label>名称<input name="name" placeholder="生产服务器"></label>
+      <div class="form-grid"><label>主机<input name="host" required placeholder="192.168.1.10"></label><label>端口<input name="port" required type="number" value="22" min="1" max="65535"></label></div>
+      <label>用户名<input name="username" required></label>
+      <label>认证方式<select name="auth_type"><option value="password">密码</option><option value="private_key">私钥</option></select></label>
+      <label class="password-field">密码<input name="password" type="password" autocomplete="new-password"></label>
+      <label class="key-field hidden">密码库密钥<select name="ssh_key_id"><option value="">手动粘贴私钥</option></select><small>选择已导入密钥，或保留“手动粘贴”使用下方内容。</small></label>
+      <label class="key-field manual-key-field hidden">私钥<textarea name="private_key" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label>
+      <label class="key-field manual-key-field hidden">私钥口令<input name="passphrase" type="password"></label>
+      <label class="check"><input name="save" type="checkbox"> 保存服务器和加密凭据</label>
+      <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">连接</button></div>
+    </form>
+  </dialog>
+  <dialog id="settings-dialog" class="settings-dialog">
+    <div class="dialog-form">
+      <div class="dialog-title"><h2>设置</h2><button type="button" class="dialog-close icon-btn">×</button></div>
+      <nav class="settings-tabs" aria-label="设置分类">
+        <button type="button" class="settings-tab active" data-settings-panel="vault">密码库</button>
+        <button type="button" class="settings-tab" data-settings-panel="agent">Agent</button>
+        <button type="button" class="settings-tab" data-settings-panel="theme">主题</button>
+      </nav>
+      <section id="settings-vault" class="settings-panel active">
+        <div class="setting-summary"><div><strong>凭据保险库</strong><p id="settings-vault-status" class="muted"></p></div><span id="settings-vault-indicator" class="status-pill"></span></div>
+        <p class="muted">服务器密码、私钥以及 Agent API 密钥均使用主密码派生的密钥加密保存。</p>
+        <div class="settings-section-title"><strong>SSH 私钥</strong><button id="ssh-key-import-toggle" type="button">导入密钥</button></div>
+        <form id="ssh-key-import-form" class="nested-form hidden">
+          <label>名称<input name="name" required maxlength="100" placeholder="例如：生产环境 Ed25519"></label>
+          <label>选择私钥文件<input name="key_file" type="file" required></label>
+          <label>私钥口令（如有）<input name="passphrase" type="password"></label>
+          <div class="dialog-actions"><button type="button" id="ssh-key-import-cancel">取消</button><button class="primary" type="submit">加密导入</button></div>
+        </form>
+        <div id="ssh-key-list" class="settings-list"></div>
+        <div class="dialog-actions"><button id="settings-vault-lock" type="button" class="danger">锁定</button><button id="settings-vault-unlock" type="button" class="primary">解锁 / 初始化</button></div>
+      </section>
+      <form id="agent-settings-form" class="settings-panel">
+        <label>API 地址<input name="api_url" type="url" required placeholder="https://api.openai.com/v1"></label>
+        <label>API 密钥<input name="api_key" type="password" autocomplete="new-password" placeholder="留空则继续使用已保存的密钥"><small id="agent-key-status">无鉴权的兼容接口可以留空。</small></label>
+        <label>模型<div class="model-row"><select name="model" required><option value="">请先获取模型列表</option></select><button id="agent-models-refresh" type="button">获取模型</button></div><input name="model_custom" class="hidden" placeholder="输入模型 ID，例如 gpt-4.1"><small id="agent-models-status">支持基础地址，也支持粘贴完整的 /chat/completions 地址。</small></label>
+        <label class="check"><input name="builtin_web_search" type="checkbox" checked> 启用内置联网工具（搜索和网页读取）</label>
+        <small>关闭后 Agent 不会使用内置搜索；仍可使用下方已启用的 MCP 搜索服务。</small>
+        <div class="settings-section-title"><strong>MCP 搜索服务</strong><button id="mcp-install-toggle" type="button">安装 MCP</button></div>
+        <div id="mcp-install-form" class="nested-form hidden">
+          <label>名称<input name="mcp_name" maxlength="100" placeholder="例如：Brave Search"></label>
+          <label>HTTP 地址<input name="mcp_url" type="url" placeholder="https://example.com/mcp"></label>
+          <label>鉴权令牌（可选）<input name="mcp_token" type="password" autocomplete="new-password"></label>
+          <div class="dialog-actions"><button id="mcp-install-cancel" type="button">取消</button><button id="mcp-install-submit" class="primary" type="button">连接并安装</button></div>
+        </div>
+        <div id="mcp-server-list" class="settings-list"></div>
+        <p class="muted">连接 SSH 后，在终端输入 <code>/agent 你的任务</code>。Agent 可读取并继续访问网页链接、执行多步命令，并在当前连接内保持多轮上下文。</p>
+        <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">保存 Agent 设置</button></div>
+      </form>
+      <section id="settings-theme" class="settings-panel">
+        <div class="theme-heading"><div><strong>界面主题</strong><p class="muted">选择后立即应用，并自动保存到当前设备。</p></div></div>
+        <div class="theme-grid" role="group" aria-label="主题配色">
+          <button type="button" class="theme-card" data-theme-choice="dark" aria-pressed="false">
+            <span class="theme-preview theme-preview-dark"><i></i><i></i><i></i><i></i></span><span class="theme-card-copy"><strong>夜幕紫</strong><small>深紫 · 珊瑚橙</small></span><span class="theme-check">✓</span>
+          </button>
+          <button type="button" class="theme-card" data-theme-choice="light" aria-pressed="false">
+            <span class="theme-preview theme-preview-light"><i></i><i></i><i></i><i></i></span><span class="theme-card-copy"><strong>暖砂白</strong><small>暖白 · 陶土橙</small></span><span class="theme-check">✓</span>
+          </button>
+          <button type="button" class="theme-card" data-theme-choice="fresh" aria-pressed="false">
+            <span class="theme-preview theme-preview-fresh"><i></i><i></i><i></i><i></i></span><span class="theme-card-copy"><strong>青苹果</strong><small>苹果绿 · 米白</small></span><span class="theme-check">✓</span>
+          </button>
+          <button type="button" class="theme-card" data-theme-choice="ocean" aria-pressed="false">
+            <span class="theme-preview theme-preview-ocean"><i></i><i></i><i></i><i></i></span><span class="theme-card-copy"><strong>雾海蓝</strong><small>海水蓝 · 雾灰</small></span><span class="theme-check">✓</span>
+          </button>
+          <button type="button" class="theme-card" data-theme-choice="midnight" aria-pressed="false">
+            <span class="theme-preview theme-preview-midnight"><i></i><i></i><i></i><i></i></span><span class="theme-card-copy"><strong>午夜蓝</strong><small>深海蓝 · 冰川青</small></span><span class="theme-check">✓</span>
+          </button>
+        </div>
+      </section>
+    </div>
+  </dialog>
+  <dialog id="vault-dialog">
+    <form id="vault-form" class="dialog-form">
+      <div class="dialog-title"><h2>解锁保险库</h2><button type="button" class="dialog-close icon-btn">×</button></div>
+      <p id="vault-help" class="muted"></p>
+      <label>主密码<input name="password" type="password" minlength="8" required autocomplete="current-password"></label>
+      <label class="check"><input name="remember" type="checkbox" checked> 在此 Windows 用户和设备上安全记住，重启应用后自动解锁</label>
+      <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">确认</button></div>
+    </form>
+  </dialog>
+  <dialog id="host-key-dialog" aria-labelledby="host-key-title">
+    <form id="host-key-form" class="dialog-form">
+      <div class="dialog-title"><h2 id="host-key-title">验证主机身份</h2></div>
+      <p id="host-key-message" class="muted"></p>
+      <dl class="host-key-details">
+        <div><dt>主机</dt><dd id="host-key-host"></dd></div>
+        <div><dt>算法</dt><dd id="host-key-algorithm"></dd></div>
+        <div><dt>SHA256 指纹</dt><dd id="host-key-fingerprint"></dd></div>
+      </dl>
+      <p id="host-key-warning" class="host-key-warning hidden"></p>
+      <div class="dialog-actions"><button id="host-key-cancel" type="button">取消</button><button id="host-key-accept" class="primary" type="submit">信任并连接</button></div>
+    </form>
+  </dialog>
+  <dialog id="editor-dialog">
+    <form id="editor-form" class="dialog-form">
+      <div class="dialog-title"><h2 id="editor-title"></h2><button type="button" class="dialog-close icon-btn">×</button></div>
+      <div id="editor-fields"></div>
+      <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">保存</button></div>
+    </form>
+  </dialog>
+  <dialog id="file-editor-dialog" class="file-editor-dialog">
+    <div class="file-editor-shell">
+      <header class="editor-toolbar">
+        <div class="editor-file"><span class="editor-file-icon">◫</span><strong id="file-editor-name">文件编辑器</strong><span id="file-editor-dirty" class="dirty-dot hidden" title="未保存">●</span></div>
+        <div class="editor-tools"><span id="file-editor-mode" class="muted"></span><button id="file-editor-reload">重新载入</button><button id="file-editor-save" class="primary">保存 <kbd>Ctrl+S</kbd></button><button id="file-editor-close" class="icon-btn">×</button></div>
+      </header>
+      <div class="editor-body"><textarea id="file-editor-textarea"></textarea></div>
+      <footer class="editor-status"><span id="file-editor-path"></span><span id="file-editor-position">Ln 1, Col 1</span><span id="file-editor-state">UTF-8</span></footer>
+    </div>
+  </dialog>
+  <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/xterm-addon-fit.js"></script>
+  <script src="/static/vendor/codemirror.js"></script>
+  <script src="/static/vendor/codemirror-closebrackets.js"></script>
+  <script src="/static/vendor/codemirror-matchbrackets.js"></script>
+  <script src="/static/vendor/codemirror-active-line.js"></script>
+  <script src="/static/vendor/codemirror-mode-python.js"></script>
+  <script src="/static/vendor/codemirror-mode-javascript.js"></script>
+  <script src="/static/vendor/codemirror-mode-xml.js"></script>
+  <script src="/static/vendor/codemirror-mode-css.js"></script>
+  <script src="/static/vendor/codemirror-mode-htmlmixed.js"></script>
+  <script src="/static/vendor/codemirror-mode-shell.js"></script>
+  <script src="/static/vendor/codemirror-mode-yaml.js"></script>
+  <script src="/static/vendor/codemirror-mode-markdown.js"></script>
+  <script src="/static/vendor/codemirror-mode-clike.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

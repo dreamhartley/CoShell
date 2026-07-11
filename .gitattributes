@@ -1,0 +1,11 @@
+# Normalize text files to LF in the repository; Git converts to the native
+# ending on checkout per the user's autocrlf setting.
+* text=auto eol=lf
+
+# Windows-only launch scripts keep CRLF so they run correctly under cmd.
+*.bat    text eol=crlf
+*.ps1    text eol=crlf
+
+# Binary assets — never diff or merge line endings.
+*.ico    binary
+*.png    binary
