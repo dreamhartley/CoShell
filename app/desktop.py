@@ -2,12 +2,47 @@
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+
+
+DEFAULT_WINDOW_SIZE = (1440, 900)
+MIN_WINDOW_SIZE = (960, 640)
+WINDOW_STATE_VERSION = 1
+
+
+def _data_dir() -> Path:
+    return Path(os.environ.get("WEBSSH_DATA_DIR", "data"))
+
+
+def _load_window_size() -> tuple[int, int]:
+    try:
+        value = json.loads((_data_dir() / "window-state.json").read_text(encoding="utf-8"))
+        if value.get("version") != WINDOW_STATE_VERSION:
+            return DEFAULT_WINDOW_SIZE
+        width, height = int(value["width"]), int(value["height"])
+        if width >= MIN_WINDOW_SIZE[0] and height >= MIN_WINDOW_SIZE[1]:
+            return width, height
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        pass
+    return DEFAULT_WINDOW_SIZE
+
+
+def _save_window_size(width: int, height: int) -> None:
+    data_dir = _data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    target = data_dir / "window-state.json"
+    temporary = data_dir / "window-state.tmp"
+    temporary.write_text(
+        json.dumps({"version": WINDOW_STATE_VERSION, "width": int(width), "height": int(height)}),
+        encoding="utf-8",
+    )
+    temporary.replace(target)
 
 
 def _resource_path(relative: str) -> Path:
@@ -64,17 +99,23 @@ def run_desktop() -> None:
     _wait_for_server(server, server_thread)
 
     try:
-        webview.create_window(
+        width, height = _load_window_size()
+        window = webview.create_window(
             "轻量 SSH 终端",
             f"http://127.0.0.1:{port}",
-            width=1440,
-            height=900,
-            min_size=(960, 640),
+            width=width,
+            height=height,
+            min_size=MIN_WINDOW_SIZE,
             confirm_close=False,
         )
+        if window is not None and hasattr(window, "events"):
+            # The resize event is dispatched on worker threads and may arrive
+            # out of order. Read and persist the final dimensions synchronously
+            # from the locking closing event instead.
+            window.events.closing += lambda: _save_window_size(window.width, window.height)
         webview.start(
             private_mode=False,
-            storage_path=str(Path(os.environ.get("WEBSSH_DATA_DIR", "data")) / "webview"),
+            storage_path=str(_data_dir() / "webview"),
             icon=str(_resource_path("assets/app-icon.ico")),
         )
     finally:

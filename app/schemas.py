@@ -104,3 +104,4 @@ class AgentModelsBody(BaseModel):
 class AgentChatBody(BaseModel):
     session_id: str
     message: str = Field(min_length=1, max_length=20000)
+    terminal_context: str | None = Field(default=None, max_length=30000)

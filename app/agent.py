@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import html
 import json
 import ipaddress
+import os
+import re
 import socket
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Callable
 
@@ -67,6 +71,114 @@ def openai_request(base_url: str, api_key: str, resource: str, *, method: str = 
     return result
 
 
+def openai_stream_request(base_url: str, api_key: str, resource: str, payload: dict[str, Any], timeout: int = 90):
+    """Yield JSON events from an OpenAI-compatible SSE response."""
+    headers = {"Accept": "text/event-stream", "Content-Type": "application/json", "User-Agent": "SSH-Terminal-Agent/1.0"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    data = json.dumps({**payload, "stream": True}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(openai_url(base_url, resource), data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or line.startswith(":") or not line.startswith("data:"):
+                    continue
+                value = line[5:].strip()
+                if value == "[DONE]":
+                    return
+                try:
+                    event = json.loads(value)
+                except json.JSONDecodeError as exc:
+                    raise AgentError("AI API 返回了无效的流式数据") from exc
+                if isinstance(event, dict):
+                    if event.get("error"):
+                        detail = event["error"].get("message") if isinstance(event["error"], dict) else str(event["error"])
+                        raise AgentError(f"AI API 流式请求失败：{detail}")
+                    yield event
+                    choices = event.get("choices") or []
+                    if any(isinstance(choice, dict) and choice.get("finish_reason") is not None for choice in choices):
+                        return
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:2000]
+        try:
+            body = json.loads(detail)
+            detail = body.get("error", {}).get("message") or body.get("detail") or detail
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise AgentError(f"AI API 请求失败（HTTP {exc.code}）：{detail}", exc.code) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise AgentError(f"无法连接 AI API：{exc}") from exc
+
+
+def model_request_options(model: str) -> dict[str, Any]:
+    """Enable thinking only for model families with a known compatible request shape."""
+    name = model.strip().lower()
+    if "glm" in name:
+        return {"thinking": {"type": "enabled", "clear_thinking": False}}
+    if "deepseek" in name:
+        return {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    return {}
+
+
+def stream_chat_message(base_url: str, api_key: str, payload: dict[str, Any], on_event: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    content: list[str] = []
+    reasoning: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+    received = False
+    answer_started = False
+    answer_cancelled = False
+    thinking = False
+
+    def finish_thinking() -> None:
+        nonlocal thinking
+        if thinking:
+            on_event({"type": "thinking_end"})
+            thinking = False
+
+    for event in openai_stream_request(base_url, api_key, "chat/completions", payload, timeout=90):
+        choices = event.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            continue
+        received = True
+        delta = choices[0].get("delta") or choices[0].get("message") or {}
+        thought = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(thought, str) and thought:
+            reasoning.append(thought)
+            if not thinking:
+                thinking = True
+                on_event({"type": "thinking_start"})
+        text = delta.get("content")
+        if isinstance(text, str) and text:
+            finish_thinking()
+            content.append(text)
+            answer_started = True
+            on_event({"type": "answer_delta", "delta": text})
+        for call in delta.get("tool_calls") or []:
+            finish_thinking()
+            if answer_started and not answer_cancelled:
+                on_event({"type": "answer_cancel"})
+                answer_cancelled = True
+            index = int(call.get("index", len(tool_calls)))
+            current = tool_calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            if call.get("id"):
+                current["id"] = call["id"]
+            if call.get("type"):
+                current["type"] = call["type"]
+            function = call.get("function") or {}
+            current["function"]["name"] += function.get("name") or ""
+            current["function"]["arguments"] += function.get("arguments") or ""
+    finish_thinking()
+    if not received:
+        raise AgentError("AI API 未返回有效的流式回复")
+    message: dict[str, Any] = {"content": "".join(content)}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    return message
+
+
 def list_models(base_url: str, api_key: str) -> tuple[list[str], str]:
     base = normalize_api_base(base_url)
     candidates = [base]
@@ -102,6 +214,8 @@ SYSTEM_PROMPT = """你是 SSH 终端内的运维 Agent，正在用户已经连�
 需要最新信息、外部文档或你不确定的公开资料时，调用 web_search。用户给出网页或 GitHub 链接、需要阅读项目说明，或要从搜索结果继续查看页面时，调用 web_fetch；可继续打开其 links 中的 URL，直到获得完成任务所需的信息。不要用 execute_command 代替网页读取或在线搜索。
 部署 GitHub 项目时，应先用 web_fetch 阅读项目主页及其 README/安装文档，再检查远程主机环境并执行部署；不要凭项目名称猜测部署命令。
 命令由非交互 shell 独立执行；工作目录、环境变量不会在两次调用间保留，需要在同一条命令中显式 cd 或设置变量。
+本机文件只能通过 workspace_list、workspace_read、workspace_write 访问应用提供的 workspace 目录，工具路径始终相对于 workspace，不要尝试访问其他本机目录。
+需要在本机 workspace 与当前远程主机之间传输单个文件时使用 sftp_transfer；上传和下载都必须明确本地相对路径与远端文件路径。不要用 execute_command 猜测或访问本机文件。
 安装或部署任务可能耗时较长，应使用非交互参数，并尽量把同一阶段的相关检查或操作合并在一条可靠的 shell 命令中，避免反复执行相同检查。命令超时后先判断任务是否可能仍在后台运行，再决定如何验证或继续。
 不要虚构执行结果。危险或不可逆操作只有在用户明确要求时才执行。
 最终用简洁中文说明已完成的工作、关键结果和任何未解决问题。"""
@@ -132,36 +246,36 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "properties": {
         "url": {"type": "string", "description": "要打开的完整 http:// 或 https:// URL；可直接使用上一次结果 links 中的 url 继续点击"},
     }, "required": ["url"]},
+}}, {"type": "function", "function": {
+    "name": "workspace_list",
+    "description": "列出本机 workspace 目录或其子目录中的文件。路径必须相对于 workspace。",
+    "parameters": {"type": "object", "properties": {
+        "path": {"type": "string", "description": "相对于 workspace 的目录，默认为 ."},
+    }},
+}}, {"type": "function", "function": {
+    "name": "workspace_read",
+    "description": "读取本机 workspace 中不超过 256 KiB 的 UTF-8 文本文件。",
+    "parameters": {"type": "object", "properties": {
+        "path": {"type": "string", "description": "相对于 workspace 的文件路径"},
+    }, "required": ["path"]},
+}}, {"type": "function", "function": {
+    "name": "workspace_write",
+    "description": "在本机 workspace 中创建或写入不超过 256 KiB 的 UTF-8 文本文件。覆盖已有文件时必须显式设置 overwrite=true。",
+    "parameters": {"type": "object", "properties": {
+        "path": {"type": "string", "description": "相对于 workspace 的文件路径"},
+        "content": {"type": "string", "description": "完整文件内容"},
+        "overwrite": {"type": "boolean", "description": "是否覆盖已有文件，默认 false"},
+    }, "required": ["path", "content"]},
+}}, {"type": "function", "function": {
+    "name": "sftp_transfer",
+    "description": "在本机 workspace 与当前 SSH 主机之间通过 SFTP 上传或下载单个文件，最大 512 MiB。",
+    "parameters": {"type": "object", "properties": {
+        "direction": {"type": "string", "enum": ["upload", "download"], "description": "upload 从 workspace 上传；download 下载到 workspace"},
+        "local_path": {"type": "string", "description": "相对于本机 workspace 的文件路径"},
+        "remote_path": {"type": "string", "description": "远端完整文件路径"},
+        "overwrite": {"type": "boolean", "description": "是否覆盖目标已有文件，默认 false"},
+    }, "required": ["direction", "local_path", "remote_path"]},
 }}]
-
-
-class _SearchParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.results: list[dict[str, str]] = []
-        self._current: dict[str, str] | None = None
-        self._capture: str | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
-        classes = set((values.get("class") or "").split())
-        if tag == "a" and "result__a" in classes:
-            href = values.get("href") or ""
-            parsed = urllib.parse.urlsplit(href)
-            target = urllib.parse.parse_qs(parsed.query).get("uddg", [href])[0]
-            self._current = {"title": "", "url": urllib.parse.unquote(target), "snippet": ""}
-            self.results.append(self._current)
-            self._capture = "title"
-        elif self._current is not None and ("result__snippet" in classes or "result-snippet" in classes):
-            self._capture = "snippet"
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in ("a", "div"):
-            self._capture = None
-
-    def handle_data(self, data: str) -> None:
-        if self._current is not None and self._capture:
-            self._current[self._capture] += data.strip() + " "
 
 
 def web_search(query: str, max_results: int = 5) -> list[dict[str, str]]:
@@ -169,29 +283,83 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, str]]:
     if not query:
         raise AgentError("搜索关键词不能为空")
     max_results = max(1, min(8, int(max_results)))
-    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    backend = os.environ.get("WEBSSH_SEARXNG_URL", "").strip().rstrip("/")
+    if not backend:
+        raise AgentError("内置 SearXNG 搜索服务尚未启动")
+    url = backend + "/search?" + urllib.parse.urlencode({
+        "q": query,
+        "format": "json",
+        "language": "auto",
+        "safesearch": 1,
+    })
     request = urllib.request.Request(url, headers={
-        "Accept": "text/html,application/xhtml+xml",
+        "Accept": "application/json",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SSH-Terminal-Agent/1.0",
+        "User-Agent": "SSH-Terminal-Agent/1.0",
     })
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            content = response.read(2 * 1024 * 1024).decode("utf-8", "replace")
+            raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise AgentError("SearXNG 搜索响应超过 2 MiB 限制")
+            payload = json.loads(raw.decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raise AgentError(f"SearXNG 搜索失败（HTTP {exc.code}）：{exc.reason}", exc.code) from exc
+    except json.JSONDecodeError as exc:
+        raise AgentError("SearXNG 返回了无效的 JSON 数据") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise AgentError(f"在线搜索失败：{exc}") from exc
-    parser = _SearchParser()
-    parser.feed(content)
-    results = []
-    for item in parser.results:
-        cleaned = {key: value.strip() for key, value in item.items()}
-        if cleaned["title"] and cleaned["url"]:
-            results.append(cleaned)
+        raise AgentError(f"无法连接内置 SearXNG：{exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise AgentError("SearXNG 搜索响应格式无效")
+    results: list[dict[str, str]] = []
+    for item in payload["results"]:
+        if not isinstance(item, dict):
+            continue
+        title_html = html.unescape(str(item.get("title") or ""))
+        title = " ".join(re.sub(r"<[^>]*>", "", title_html).split())
+        target = str(item.get("url") or "").strip()
+        parsed = urllib.parse.urlsplit(target)
+        snippet_html = html.unescape(str(item.get("content") or ""))
+        snippet = " ".join(re.sub(r"<[^>]*>", "", snippet_html).split())
+        if title and parsed.scheme in ("http", "https") and parsed.netloc:
+            results.append({"title": title, "url": target, "snippet": snippet})
         if len(results) >= max_results:
             break
     if not results:
-        raise AgentError("在线搜索没有返回可用结果")
+        unavailable = payload.get("unresponsive_engines") or []
+        names = [str(item[0] if isinstance(item, (list, tuple)) and item else item) for item in unavailable[:3]]
+        detail = f"；不可用引擎：{', '.join(names)}" if names else ""
+        raise AgentError("SearXNG 没有返回可用结果" + detail)
     return results
+
+
+_FAKE_IPV4_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+_FAKE_IPV6_NETWORK = ipaddress.ip_network("fc00::/7")
+
+
+def _resolved_addresses(hostname: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    return [ipaddress.ip_address(item[4][0].split("%", 1)[0]) for item in addresses]
+
+
+def _is_fake_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return address in (_FAKE_IPV4_NETWORK if address.version == 4 else _FAKE_IPV6_NETWORK)
+
+
+def _looks_like_fake_ip_set(addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address]) -> bool:
+    """Require the standard benchmark IPv4 range, avoiding broad ULA-only bypasses."""
+    return bool(addresses) and all(_is_fake_address(x) for x in addresses) and any(
+        x.version == 4 and x in _FAKE_IPV4_NETWORK for x in addresses
+    )
+
+
+def _fake_ip_mode_active() -> bool:
+    """Detect a system-wide TUN Fake-IP resolver using independent public names."""
+    try:
+        samples = [_resolved_addresses(host, 443) for host in ("example.com", "www.iana.org")]
+    except (socket.gaierror, ValueError, OSError):
+        return False
+    return all(_looks_like_fake_ip_set(sample) for sample in samples)
 
 
 def _validate_public_url(url: str) -> str:
@@ -207,14 +375,18 @@ def _validate_public_url(url: str) -> str:
     except ValueError as exc:
         raise AgentError("网页地址端口无效") from exc
     try:
-        addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+        addresses = _resolved_addresses(parsed.hostname, port)
     except socket.gaierror as exc:
         raise AgentError(f"无法解析网页域名：{parsed.hostname}") from exc
     if not addresses:
         raise AgentError(f"无法解析网页域名：{parsed.hostname}")
-    for item in addresses:
-        address = ipaddress.ip_address(item[4][0].split("%", 1)[0])
-        if not address.is_global:
+    try:
+        literal_host = ipaddress.ip_address(parsed.hostname) is not None
+    except ValueError:
+        literal_host = False
+    if not all(address.is_global for address in addresses):
+        fake_ip_safe = not literal_host and _looks_like_fake_ip_set(addresses) and _fake_ip_mode_active()
+        if not fake_ip_safe:
             raise AgentError("为安全起见，网页工具不能访问本机、内网或保留地址")
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path or "/", parsed.query, ""))
 
@@ -349,6 +521,9 @@ class AgentRegistry:
         executor: Callable[[str, int], dict[str, Any]], *, builtin_web_search: bool = True,
         mcp_tools: list[dict[str, Any]] | None = None,
         mcp_executor: Callable[[int, str, dict[str, Any]], dict[str, Any]] | None = None,
+        local_executor: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        stream_response: bool = False,
     ) -> dict[str, Any]:
         if not text.strip():
             raise AgentError("请输入 Agent 指令")
@@ -361,6 +536,8 @@ class AgentRegistry:
             available_tools = [TOOLS[0]]
             if builtin_web_search:
                 available_tools.extend((TOOLS[1], TOOLS[2]))
+            if local_executor:
+                available_tools.extend(TOOLS[3:])
             mcp_map: dict[str, dict[str, Any]] = {}
             for item in mcp_tools:
                 exposed_name = str(item["exposed_name"])
@@ -373,17 +550,30 @@ class AgentRegistry:
             search_note = "内置联网搜索和网页读取已启用。" if builtin_web_search else "内置联网搜索和网页读取已关闭。"
             if mcp_map:
                 search_note += " 可使用已启用的 MCP 搜索工具。"
-            messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + search_note}, *conversation.messages, {"role": "user", "content": text.strip()}]
+            local_now = datetime.now().astimezone()
+            runtime_note = f"当前本地日期：{local_now.date().isoformat()}；本地时区：{local_now.tzname() or local_now.utcoffset()}。"
+            if local_executor:
+                runtime_note += " 本机 workspace 工具与 SFTP 文件传输工具已启用。"
+            messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + runtime_note + "\n" + search_note}, *conversation.messages, {"role": "user", "content": text.strip()}]
             steps: list[dict[str, Any]] = []
             for _ in range(MAX_AGENT_ROUNDS):
-                response = openai_request(base_url, api_key, "chat/completions", method="POST", payload={
+                request_payload = {
                     "model": model, "messages": messages, "tools": available_tools, "tool_choice": "auto", "temperature": 0.2,
-                }, timeout=90)
-                choices = response.get("choices") or []
-                if not choices or not isinstance(choices[0], dict):
-                    raise AgentError("AI API 未返回有效回复")
-                message = choices[0].get("message") or {}
+                }
+                request_payload.update(model_request_options(model))
+                if "deepseek" in model.lower():
+                    request_payload.pop("tool_choice", None)
+                if stream_response and on_event:
+                    message = stream_chat_message(base_url, api_key, request_payload, on_event)
+                else:
+                    response = openai_request(base_url, api_key, "chat/completions", method="POST", payload=request_payload, timeout=90)
+                    choices = response.get("choices") or []
+                    if not choices or not isinstance(choices[0], dict):
+                        raise AgentError("AI API 未返回有效回复")
+                    message = choices[0].get("message") or {}
                 assistant_message: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
+                if message.get("reasoning_content"):
+                    assistant_message["reasoning_content"] = message["reasoning_content"]
                 tool_calls = message.get("tool_calls") or []
                 if tool_calls:
                     assistant_message["tool_calls"] = tool_calls
@@ -402,10 +592,16 @@ class AgentRegistry:
                             timeout = max(5, min(MAX_COMMAND_TIMEOUT, int(arguments.get("timeout", 120))))
                             if not command:
                                 raise ValueError("命令为空")
+                            if on_event:
+                                on_event({"type": "command_start", "command": command})
                             result = executor(command, timeout)
                             steps.append({"command": command, **result})
+                            if on_event:
+                                on_event({"type": "command_end", **result})
                         except (ValueError, TypeError, json.JSONDecodeError, OSError, KeyError) as exc:
                             result = {"error": str(exc)}
+                            if on_event:
+                                on_event({"type": "command_end", "exit_code": -1, "stdout": "", "stderr": str(exc)})
                     elif tool_name == "web_search":
                         if not builtin_web_search:
                             result = {"error": "内置联网搜索已关闭"}
@@ -415,6 +611,8 @@ class AgentRegistry:
                             arguments = json.loads(function.get("arguments") or "{}")
                             query = str(arguments.get("query") or "").strip()
                             max_results = max(1, min(8, int(arguments.get("max_results", 5))))
+                            if on_event:
+                                on_event({"type": "activity", "activity": "search", "label": query})
                             result = {"results": web_search(query, max_results)}
                             steps.append({"search": query, "result_count": len(result["results"])})
                         except (AgentError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -427,14 +625,51 @@ class AgentRegistry:
                         try:
                             arguments = json.loads(function.get("arguments") or "{}")
                             url = str(arguments.get("url") or "").strip()
+                            if on_event:
+                                on_event({"type": "activity", "activity": "fetch", "label": url})
                             result = web_fetch(url)
                             steps.append({"fetch": result["url"], "title": result["title"], "link_count": len(result["links"]), "truncated": result["truncated"]})
                         except (AgentError, ValueError, TypeError, json.JSONDecodeError) as exc:
                             result = {"error": str(exc)}
+                    elif tool_name in {"workspace_list", "workspace_read", "workspace_write", "sftp_transfer"} and local_executor:
+                        label = tool_name
+                        arguments: dict[str, Any] = {}
+                        try:
+                            arguments = json.loads(function.get("arguments") or "{}")
+                            if not isinstance(arguments, dict):
+                                raise ValueError("工具参数必须是对象")
+                            label = str(arguments.get("local_path") or arguments.get("path") or tool_name)
+                            if on_event:
+                                on_event({
+                                    "type": "local_tool_start", "id": call.get("id", ""), "tool": tool_name,
+                                    "label": label, "direction": arguments.get("direction"),
+                                })
+                            result = local_executor(tool_name, arguments)
+                            step = {"tool": tool_name}
+                            for key in ("path", "direction", "local_path", "remote_path", "size"):
+                                if key in result:
+                                    step[key] = result[key]
+                            steps.append(step)
+                            if on_event:
+                                on_event({
+                                    "type": "local_tool_end", "id": call.get("id", ""), "tool": tool_name,
+                                    "label": label, "direction": arguments.get("direction"), "success": True,
+                                    "size": result.get("size"), "entry_count": len(result.get("entries") or []),
+                                })
+                        except (AgentError, ValueError, TypeError, json.JSONDecodeError, OSError, KeyError) as exc:
+                            result = {"error": str(exc)}
+                            if on_event:
+                                on_event({
+                                    "type": "local_tool_end", "id": call.get("id", ""), "tool": tool_name,
+                                    "label": label, "direction": arguments.get("direction"), "success": False,
+                                    "error": str(exc),
+                                })
                     elif tool_name in mcp_map and mcp_executor:
                         item = mcp_map[tool_name]
                         try:
                             arguments = json.loads(function.get("arguments") or "{}")
+                            if on_event:
+                                on_event({"type": "activity", "activity": "mcp", "label": f"{item['server_name']} · {item['tool_name']}"})
                             result = mcp_executor(int(item["server_id"]), str(item["tool_name"]), arguments)
                             steps.append({"mcp": item["server_name"], "tool": item["tool_name"]})
                         except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
@@ -444,11 +679,13 @@ class AgentRegistry:
                     messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(result, ensure_ascii=False)})
             messages.append({"role": "system", "content": "工具执行轮次已达到本次任务上限。不要再调用工具；请根据已有执行结果总结当前完成情况、明确尚未完成的步骤，并告诉用户可用下一条 /agent 指令继续。"})
             try:
-                response = openai_request(base_url, api_key, "chat/completions", method="POST", payload={
-                    "model": model, "messages": messages, "temperature": 0.2,
-                }, timeout=90)
-                choices = response.get("choices") or []
-                message = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
+                final_payload = {"model": model, "messages": messages, "temperature": 0.2, **model_request_options(model)}
+                if stream_response and on_event:
+                    message = stream_chat_message(base_url, api_key, final_payload, on_event)
+                else:
+                    response = openai_request(base_url, api_key, "chat/completions", method="POST", payload=final_payload, timeout=90)
+                    choices = response.get("choices") or []
+                    message = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
                 answer = (message or {}).get("content") or "本次任务已执行较多步骤，但尚未得到最终确认。请发送“/agent 继续刚才的任务”继续处理。"
             except AgentError:
                 answer = "本次任务已达到 30 轮执行上限，已执行的命令和结果显示在上方。请发送“/agent 继续刚才的任务并确认安装状态”，我会沿用当前上下文继续。"

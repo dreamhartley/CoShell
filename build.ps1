@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+$env:PYTHONDONTWRITEBYTECODE = "1"
 
 if (-not (Test-Path ".venv")) {
     python -m venv .venv
@@ -15,7 +16,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     --icon "assets\app-icon.ico" `
     --add-data "static;static" `
     --add-data "assets\app-icon.ico;assets" `
+    --add-data "third_party\searxng;third_party\searxng" `
+    --paths "third_party\searxng" `
     --collect-all webview `
+    --collect-all searx `
     --hidden-import app.main `
     --hidden-import uvicorn.logging `
     --hidden-import uvicorn.loops.auto `

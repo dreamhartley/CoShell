@@ -73,6 +73,7 @@ class SSHSession:
     host: str
     port: int
     username: str
+    server_id: int | None = None
 
     def close(self) -> None:
         for item in (self.sftp, self.channel, self.client):
@@ -112,7 +113,8 @@ class SessionRegistry:
             transport.set_keepalive(30)
             channel = client.invoke_shell(term="xterm-256color", width=int(data.get("cols", 100)), height=int(data.get("rows", 30)))
             sftp = client.open_sftp()
-            session = SSHSession(secrets.token_urlsafe(24), client, channel, sftp, host, port, username)
+            server_id = int(data["server_id"]) if data.get("server_id") is not None else None
+            session = SSHSession(secrets.token_urlsafe(24), client, channel, sftp, host, port, username, server_id)
             with self._lock:
                 self._items[session.id] = session
             return session

@@ -1,14 +1,23 @@
+import io
+import json
 import sqlite3
+import stat
 import sys
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
 from app.database import Database
 from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path
 from app.vault import Vault, VaultError
-from app.agent import AgentError, AgentRegistry, _WebPageParser, _validate_public_url, list_models, normalize_api_base, openai_url
+from app.agent import AgentError, AgentRegistry, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
+from app.main import agent_message_with_terminal_context
+from app.agent_workspace import AgentWorkspace
+from app.searxng_backend import _write_settings
 from app.mcp import normalize_mcp_url, search_tools
 from app.device_secrets import protect as protect_device_secret, unprotect as unprotect_device_secret
+from app.backup import BackupError, create_backup, parse_backup, restore_backup
 
 
 def test_vault_encrypts_and_unlocks(tmp_path):
@@ -45,6 +54,42 @@ def test_database_never_stores_plain_secret(tmp_path):
     row = db.fetchone("SELECT password_enc FROM servers")
     assert b"do-not-store-me" not in row["password_enc"]
     assert vault.decrypt(row["password_enc"]) == "do-not-store-me"
+    db.close()
+
+
+def test_backup_round_trip_keeps_encrypted_data_and_excludes_auto_unlock(tmp_path):
+    source = Database(tmp_path / "source.db")
+    vault = Vault(source)
+    vault.initialize("portable master password")
+    cipher = vault.encrypt("secret-password")
+    source.execute("INSERT INTO servers(name,host,username,password_enc) VALUES(?,?,?,?)", ("prod", "example.test", "root", cipher))
+    source.execute("INSERT INTO settings(key,value) VALUES('theme','ocean')")
+    source.execute("INSERT INTO settings(key,value) VALUES('desktop_auto_unlock','device-only-secret')")
+    content = create_backup(source)
+    assert b"secret-password" not in content
+    assert b"device-only-secret" not in content
+
+    target = Database(tmp_path / "target.db")
+    target.execute("INSERT INTO shortcuts(name,command) VALUES('old','false')")
+    counts = restore_backup(target, content)
+    assert counts["servers"] == 1
+    assert target.fetchone("SELECT name,host FROM servers") == {"name": "prod", "host": "example.test"}
+    assert target.fetchone("SELECT value FROM settings WHERE key='theme'") == {"value": "ocean"}
+    assert target.fetchone("SELECT value FROM settings WHERE key='desktop_auto_unlock'") is None
+    assert target.fetchone("SELECT id FROM shortcuts") is None
+    restored_vault = Vault(target)
+    restored_vault.unlock("portable master password")
+    assert restored_vault.decrypt(target.fetchone("SELECT password_enc FROM servers")["password_enc"]) == "secret-password"
+    source.close()
+    target.close()
+
+
+def test_invalid_backup_is_rejected_without_changing_database(tmp_path):
+    db = Database(tmp_path / "test.db")
+    db.execute("INSERT INTO shortcuts(name,command) VALUES('keep','uptime')")
+    with pytest.raises(BackupError):
+        restore_backup(db, b'{"format":"wrong"}')
+    assert db.fetchone("SELECT name FROM shortcuts") == {"name": "keep"}
     db.close()
 
 
@@ -120,6 +165,80 @@ def test_aborted_upload_removes_partial_file():
     assert sftp.removed == ["/tmp/partial.bin"]
 
 
+class MemorySftpFile(io.BytesIO):
+    def __init__(self, initial=b"", on_close=None):
+        super().__init__(initial)
+        self.on_close = on_close
+    def set_pipelined(self, _value): pass
+    def close(self):
+        if self.on_close and not self.closed:
+            self.on_close(self.getvalue())
+        super().close()
+
+
+class MemorySftp:
+    def __init__(self):
+        self.files = {"/remote/source.bin": b"download-data"}
+    def lstat(self, path):
+        if path not in self.files: raise FileNotFoundError(path)
+        return self.stat(path)
+    def stat(self, path):
+        if path not in self.files: raise FileNotFoundError(path)
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_size=len(self.files[path]))
+    def open(self, path, mode):
+        if mode == "rb":
+            if path not in self.files: raise FileNotFoundError(path)
+            return MemorySftpFile(self.files[path])
+        if mode == "wb":
+            return MemorySftpFile(on_close=lambda value: self.files.__setitem__(path, value))
+        raise ValueError(mode)
+    def posix_rename(self, source, destination): self.files[destination] = self.files.pop(source)
+    def rename(self, source, destination): self.posix_rename(source, destination)
+    def remove(self, path):
+        if path not in self.files: raise FileNotFoundError(path)
+        del self.files[path]
+
+
+def test_agent_workspace_is_sandboxed_and_supports_sftp(tmp_path):
+    sftp = MemorySftp()
+    session = SimpleNamespace(sftp=sftp, server_id=7, host="example.test", port=22, username="root")
+    workspace = AgentWorkspace(tmp_path / "workspace", lambda _session_id: session)
+    written = workspace.write("notes/info.txt", "hello", False)
+    assert written["path"] == "notes/info.txt"
+    assert workspace.read("notes/info.txt")["content"] == "hello"
+    assert workspace.list("notes")["entries"][0]["name"] == "info.txt"
+    with pytest.raises(ValueError, match="不能离开"):
+        workspace.read("../secret.txt")
+    with pytest.raises(FileExistsError):
+        workspace.write("notes/info.txt", "replace", False)
+
+    scoped = workspace.execute("ssh-1", "workspace_write", {"path": "notes/info.txt", "content": "hello"})
+    assert scoped["path"] == "notes/info.txt"
+    uploaded = workspace.sftp_transfer("ssh-1", "upload", "notes/info.txt", "/remote/info.txt", False)
+    assert uploaded["size"] == 5 and sftp.files["/remote/info.txt"] == b"hello"
+    downloaded = workspace.sftp_transfer("ssh-1", "download", "downloads/source.bin", "/remote/source.bin", False)
+    assert downloaded["size"] == 13
+    assert (tmp_path / "workspace" / "server-7" / "downloads" / "source.bin").read_bytes() == b"download-data"
+
+
+def test_agent_workspace_is_isolated_per_server_and_can_be_deleted(tmp_path):
+    sessions = {
+        "one": SimpleNamespace(sftp=MemorySftp(), server_id=1, host="one.test", port=22, username="root"),
+        "two": SimpleNamespace(sftp=MemorySftp(), server_id=2, host="two.test", port=22, username="root"),
+    }
+    workspace = AgentWorkspace(tmp_path / "workspace", sessions.__getitem__)
+
+    workspace.execute("one", "workspace_write", {"path": "same.txt", "content": "server one"})
+    workspace.execute("two", "workspace_write", {"path": "same.txt", "content": "server two"})
+
+    assert workspace.execute("one", "workspace_read", {"path": "same.txt"})["content"] == "server one"
+    assert workspace.execute("two", "workspace_read", {"path": "same.txt"})["content"] == "server two"
+    assert workspace.server_workspace_exists(1)
+    assert workspace.delete_server_workspace(1)
+    assert not (tmp_path / "workspace" / "server-1").exists()
+    assert (tmp_path / "workspace" / "server-2" / "same.txt").is_file()
+
+
 def test_openai_url_accepts_compatible_base_url():
     assert openai_url("https://example.test/v1/", "models") == "https://example.test/v1/models"
     assert normalize_api_base("https://example.test/v1/chat/completions?ignored=1") == "https://example.test/v1"
@@ -160,6 +279,96 @@ def test_agent_executes_tool_and_keeps_context(monkeypatch):
     assert any(message.get("content") == "系统是 Linux。" for message in requests[-1]["messages"])
 
 
+def test_agent_emits_live_command_events(monkeypatch):
+    replies = iter([
+        {"choices": [{"message": {"content": "", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command":"whoami"}'}}]}}]},
+        {"choices": [{"message": {"content": "完成"}}]},
+    ])
+    monkeypatch.setattr("app.agent.openai_request", lambda *args, **kwargs: next(replies))
+    events = []
+    AgentRegistry().chat(
+        "ssh-events", "当前用户", "https://example.test/v1", "key", "model",
+        lambda command, timeout: {"exit_code": 0, "stdout": "root\n", "stderr": ""},
+        on_event=events.append,
+    )
+    assert events == [
+        {"type": "command_start", "command": "whoami"},
+        {"type": "command_end", "exit_code": 0, "stdout": "root\n", "stderr": ""},
+    ]
+
+
+def test_agent_streams_answer_deltas(monkeypatch):
+    chunks = [
+        {"choices": [{"delta": {"content": "你好"}}]},
+        {"choices": [{"delta": {"content": "，世界"}}]},
+    ]
+    monkeypatch.setattr("app.agent.openai_stream_request", lambda *_args, **_kwargs: iter(chunks))
+    events = []
+    message = stream_chat_message("https://example.test/v1", "key", {"model": "model"}, events.append)
+    assert message == {"content": "你好，世界"}
+    assert events == [
+        {"type": "answer_delta", "delta": "你好"},
+        {"type": "answer_delta", "delta": "，世界"},
+    ]
+
+
+def test_glm_and_deepseek_thinking_is_hidden_but_preserved(monkeypatch):
+    chunks = [
+        {"choices": [{"delta": {"reasoning_content": "private reasoning"}}]},
+        {"choices": [{"delta": {"content": "public answer"}}]},
+    ]
+    monkeypatch.setattr("app.agent.openai_stream_request", lambda *_args, **_kwargs: iter(chunks))
+    events = []
+    message = stream_chat_message("https://example.test/v1", "key", {"model": "glm-5"}, events.append)
+    assert message == {"content": "public answer", "reasoning_content": "private reasoning"}
+    assert events == [
+        {"type": "thinking_start"},
+        {"type": "thinking_end"},
+        {"type": "answer_delta", "delta": "public answer"},
+    ]
+    assert "private reasoning" not in str(events)
+    assert model_request_options("glm-5.2") == {"thinking": {"type": "enabled", "clear_thinking": False}}
+    assert model_request_options("deepseek-v4-pro") == {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    assert model_request_options("gpt-compatible") == {}
+
+
+def test_deepseek_tool_round_replays_reasoning_content(monkeypatch):
+    replies = iter([
+        {"choices": [{"message": {"content": "", "reasoning_content": "hidden plan", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command":"pwd"}'}}]}}]},
+        {"choices": [{"message": {"content": "done", "reasoning_content": "hidden summary"}}]},
+    ])
+    payloads = []
+    def fake_request(*_args, **kwargs):
+        payloads.append(kwargs["payload"])
+        return next(replies)
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    AgentRegistry().chat(
+        "ssh-deepseek", "where", "https://example.test/v1", "key", "deepseek-v4-pro",
+        lambda *_args: {"exit_code": 0, "stdout": "/root\n", "stderr": ""},
+    )
+    assert payloads[0]["thinking"] == {"type": "enabled"}
+    assert payloads[0]["reasoning_effort"] == "high"
+    assert "tool_choice" not in payloads[0]
+    assistant = next(message for message in payloads[1]["messages"] if message.get("tool_calls"))
+    assert assistant["reasoning_content"] == "hidden plan"
+
+
+def test_openai_stream_stops_on_finish_reason_without_done(monkeypatch):
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def __iter__(self):
+            return iter([
+                b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+                b'data: {"choices":[{"delta":{"content":"must not be read"}}]}\n',
+            ])
+    monkeypatch.setattr("app.agent.urllib.request.urlopen", lambda *_args, **_kwargs: FakeResponse())
+    events = list(openai_stream_request("https://example.test/v1", "key", "chat/completions", {"model": "model"}))
+    assert len(events) == 2
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+
+
 def test_agent_can_search_without_executing_ssh_command(monkeypatch):
     replies = iter([
         {"choices": [{"message": {"content": "", "tool_calls": [{"id": "search-1", "type": "function", "function": {"name": "web_search", "arguments": '{"query":"Python latest release","max_results":3}'}}]}}]},
@@ -172,6 +381,73 @@ def test_agent_can_search_without_executing_ssh_command(monkeypatch):
     assert executed == []
     assert result["steps"] == [{"search": "Python latest release", "result_count": 1}]
     assert result["message"].startswith("搜索结果")
+
+
+def test_agent_prompt_includes_local_date_and_workspace_tools(monkeypatch):
+    replies = iter([
+        {"choices": [{"message": {"content": "", "tool_calls": [{
+            "id": "local-1", "type": "function",
+            "function": {"name": "workspace_list", "arguments": '{"path":"."}'},
+        }]}}]},
+        {"choices": [{"message": {"content": "已查看 workspace。"}}]},
+    ])
+    payloads = []
+    local_calls = []
+    events = []
+
+    def fake_request(*_args, **kwargs):
+        payloads.append(kwargs["payload"])
+        return next(replies)
+
+    def local_executor(tool, arguments):
+        local_calls.append((tool, arguments))
+        return {"path": ".", "entries": [], "truncated": False}
+
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    result = AgentRegistry().chat(
+        "ssh-local", "查看本地工作区", "https://example.test/v1", "key", "model", lambda *_args: {},
+        local_executor=local_executor, on_event=events.append,
+    )
+    names = {tool["function"]["name"] for tool in payloads[0]["tools"]}
+    assert names >= {"workspace_list", "workspace_read", "workspace_write", "sftp_transfer"}
+    assert datetime.now().astimezone().date().isoformat() in payloads[0]["messages"][0]["content"]
+    assert local_calls == [("workspace_list", {"path": "."})]
+    assert result["steps"] == [{"tool": "workspace_list", "path": "."}]
+    assert events == [
+        {"type": "local_tool_start", "id": "local-1", "tool": "workspace_list", "label": ".", "direction": None},
+        {"type": "local_tool_end", "id": "local-1", "tool": "workspace_list", "label": ".", "direction": None, "success": True, "size": None, "entry_count": 0},
+    ]
+
+
+def test_web_search_uses_bundled_searxng_json(monkeypatch):
+    payload = {
+        "results": [
+            {"title": "Example <b>Result</b>", "url": "https://example.com/page", "content": "Useful &amp; current <b>summary</b>."},
+            {"title": "Unsafe", "url": "javascript:alert(1)", "content": "ignored"},
+        ]
+    }
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self, _limit): return json.dumps(payload).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("WEBSSH_SEARXNG_URL", "http://127.0.0.1:9876")
+    monkeypatch.setattr("app.agent.urllib.request.urlopen", fake_urlopen)
+    assert web_search("release notes", 5) == [{
+        "title": "Example Result",
+        "url": "https://example.com/page",
+        "snippet": "Useful & current summary.",
+    }]
+    assert captured["timeout"] == 20
+    assert captured["url"].startswith("http://127.0.0.1:9876/search?")
+    assert "format=json" in captured["url"] and "q=release+notes" in captured["url"]
 
 
 def test_web_page_parser_extracts_readable_text_and_clickable_links():
@@ -190,6 +466,35 @@ def test_web_fetch_url_rejects_private_network(monkeypatch):
     monkeypatch.setattr("app.agent.socket.getaddrinfo", lambda *_args, **_kwargs: [(2, 1, 6, "", ("127.0.0.1", 80))])
     with pytest.raises(AgentError, match="内网"):
         _validate_public_url("http://example.test/admin")
+
+
+def test_web_fetch_allows_detected_tun_fake_ip_but_not_literal_ip(monkeypatch):
+    def fake_getaddrinfo(host, port, **_kwargs):
+        if host == "internal.test":
+            return [(2, 1, 6, "", ("10.0.0.8", port))]
+        offset = 5 if host == "example.com" else 6 if host == "www.iana.org" else 7
+        return [
+            (2, 1, 6, "", (f"198.18.0.{offset}", port)),
+            (23, 1, 6, "", (f"fc00::{offset}", port, 0, 0)),
+        ]
+
+    monkeypatch.setattr("app.agent.socket.getaddrinfo", fake_getaddrinfo)
+    assert _validate_public_url("https://www.reuters.com/world/us") == "https://www.reuters.com/world/us"
+    with pytest.raises(AgentError, match="保留地址"):
+        _validate_public_url("https://198.18.0.7/")
+    with pytest.raises(AgentError, match="内网"):
+        _validate_public_url("https://internal.test/")
+
+
+def test_bundled_searxng_settings_are_private_and_enable_json(tmp_path):
+    path = tmp_path / "settings.yml"
+    _write_settings(path, 9123)
+    value = path.read_text(encoding="utf-8")
+    assert 'bind_address: "127.0.0.1"' in value
+    assert "port: 9123" in value
+    assert "    - json" in value
+    assert "public_instance: false" in value
+    assert "brave" in value and "startpage" in value and "duckduckgo" in value
 
 
 def test_agent_can_fetch_page_then_execute_deployment(monkeypatch):

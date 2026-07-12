@@ -33,10 +33,27 @@
         </div>
       </section>
       <nav class="side-tabs" aria-label="工具">
+        <button class="side-tab" data-panel="agent">Agent</button>
         <button class="side-tab active" data-panel="sftp">文件</button>
         <button class="side-tab" data-panel="shortcuts">指令</button>
         <button class="side-tab" data-panel="servers">主机</button>
       </nav>
+      <section id="panel-agent" class="side-panel agent-panel">
+        <div class="agent-panel-head">
+          <div><strong>Agent</strong><span id="agent-session-label">未连接终端</span></div>
+          <button id="agent-open-settings" class="icon-btn" type="button" title="Agent 设置">⚙</button>
+        </div>
+        <div id="agent-chat" class="agent-chat" aria-live="polite">
+          <div class="agent-welcome"><span>✦</span><strong>SSH Agent</strong><p>选择一个已连接的终端，然后告诉我需要查询或执行的任务。</p></div>
+        </div>
+        <form id="agent-chat-form" class="agent-composer">
+          <div class="agent-input-shell">
+            <textarea id="agent-chat-input" rows="4" maxlength="20000" placeholder="让 Agent 检查服务、部署项目…" aria-label="发送给 Agent 的消息"></textarea>
+            <span id="agent-chat-hint">Enter 发送 · Shift+Enter 换行</span>
+            <button id="agent-chat-send" class="agent-send primary" type="submit" aria-label="发送" title="发送">↑</button>
+          </div>
+        </form>
+      </section>
       <section id="panel-sftp" class="side-panel active">
         <div class="panel-head"><strong>SFTP</strong><button id="sftp-refresh" class="icon-btn" title="刷新">↻</button></div>
         <div class="path-row"><button id="sftp-up" class="icon-btn">↑</button><input id="sftp-path" value="." aria-label="远程路径"><button id="sftp-go" class="soft-btn">前往</button></div>
@@ -100,6 +117,7 @@
         <button type="button" class="settings-tab active" data-settings-panel="vault">密码库</button>
         <button type="button" class="settings-tab" data-settings-panel="agent">Agent</button>
         <button type="button" class="settings-tab" data-settings-panel="theme">主题</button>
+        <button type="button" class="settings-tab" data-settings-panel="backup">备份/还原</button>
       </nav>
       <section id="settings-vault" class="settings-panel active">
         <div class="setting-summary"><div><strong>凭据保险库</strong><p id="settings-vault-status" class="muted"></p></div><span id="settings-vault-indicator" class="status-pill"></span></div>
@@ -151,6 +169,19 @@
           </button>
         </div>
       </section>
+      <section id="settings-backup" class="settings-panel">
+        <div class="setting-summary"><div><strong>备份应用数据</strong><p class="muted">导出连接、快捷命令、主题、私钥及 Agent/MCP 配置。</p></div></div>
+        <p class="muted">密码、私钥和 API 密钥仍以当前主密码加密。此设备的自动解锁信息不会包含在备份中。</p>
+        <div class="backup-actions">
+          <button id="backup-download" type="button" class="primary">下载备份</button>
+        </div>
+        <div class="settings-section-title"><strong>从备份还原</strong></div>
+        <div class="nested-form">
+          <label>选择 JSON 备份文件<input id="backup-file" type="file" accept="application/json,.json"></label>
+          <small>还原会整体替换当前应用数据、断开现有 SSH 连接，并锁定密码库。之后请使用备份创建时的主密码解锁。</small>
+          <div class="dialog-actions"><button id="backup-restore" type="button" class="danger">还原并替换当前数据</button></div>
+        </div>
+      </section>
     </div>
   </dialog>
   <dialog id="vault-dialog">
@@ -191,6 +222,15 @@
       <div class="editor-body"><textarea id="file-editor-textarea"></textarea></div>
       <footer class="editor-status"><span id="file-editor-path"></span><span id="file-editor-position">Ln 1, Col 1</span><span id="file-editor-state">UTF-8</span></footer>
     </div>
+  </dialog>
+  <dialog id="app-prompt-dialog" class="app-prompt-dialog" aria-labelledby="app-prompt-title">
+    <form id="app-prompt-form" class="dialog-form">
+      <div class="dialog-title"><h2 id="app-prompt-title">请确认</h2><button id="app-prompt-close" type="button" class="icon-btn" aria-label="关闭">×</button></div>
+      <p id="app-prompt-message" class="app-prompt-message"></p>
+      <label id="app-prompt-field" class="hidden"><span id="app-prompt-label">输入内容</span><input id="app-prompt-input" autocomplete="off"></label>
+      <div id="app-prompt-options" class="app-prompt-options hidden"></div>
+      <div class="dialog-actions"><button id="app-prompt-cancel" type="button">取消</button><button id="app-prompt-submit" class="primary" type="submit">确认</button></div>
+    </form>
   </dialog>
   <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
   <script src="/static/vendor/xterm.js"></script>

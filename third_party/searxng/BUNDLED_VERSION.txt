@@ -1,0 +1,11 @@
+SearXNG bundled runtime
+Upstream: https://github.com/searxng/searxng
+Revision: 62a1ab7eddc84e98e97605e0a1378e806de6185c
+License: AGPL-3.0-or-later (see LICENSE in this directory)
+
+Only the upstream searx Python package and corresponding documentation/license
+are included. Linux deployment scripts and development-only files are omitted
+because they cannot be used by the Windows desktop sidecar.
+
+Local compatibility patch: searx/valkeydb.py treats the Unix-only pwd module as
+optional. The bundled private instance disables Valkey and the public limiter.

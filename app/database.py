@@ -126,6 +126,36 @@ class Database:
         with self._lock:
             return [dict(row) for row in self._conn.execute(sql, tuple(values)).fetchall()]
 
+    def snapshot(self, tables: dict[str, tuple[str, ...]]) -> dict[str, list[dict[str, Any]]]:
+        """Read a consistent snapshot of a fixed set of tables."""
+        with self._lock:
+            result: dict[str, list[dict[str, Any]]] = {}
+            for table, columns in tables.items():
+                selected = ",".join(f'"{column}"' for column in columns)
+                result[table] = [dict(row) for row in self._conn.execute(f'SELECT {selected} FROM "{table}"')]
+            return result
+
+    def replace_snapshot(self, tables: dict[str, tuple[str, ...]], rows: dict[str, list[dict[str, Any]]]) -> None:
+        """Atomically replace a fixed set of tables with validated snapshot rows."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                for table in reversed(tuple(tables)):
+                    self._conn.execute(f'DELETE FROM "{table}"')
+                for table, columns in tables.items():
+                    if not rows[table]:
+                        continue
+                    names = ",".join(f'"{column}"' for column in columns)
+                    placeholders = ",".join("?" for _ in columns)
+                    self._conn.executemany(
+                        f'INSERT INTO "{table}" ({names}) VALUES ({placeholders})',
+                        ([row[column] for column in columns] for row in rows[table]),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
