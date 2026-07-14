@@ -9,6 +9,9 @@ import posixpath
 import secrets
 import socket
 import stat
+import subprocess
+import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -20,15 +23,16 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .agent import AgentError, AgentRegistry, list_models
+from .agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, list_models
+from .agent_permissions import AgentApprovalRegistry, classify_dangerous_command
 from .agent_workspace import AgentWorkspace
 from .backup import BackupError, MAX_BACKUP_BYTES, create_backup, parse_backup, restore_backup
 from .database import Database
 from .device_secrets import DeviceSecretError, protect as protect_device_secret, unprotect as unprotect_device_secret
 from .mcp import MCPError, call_tool as call_mcp_tool, list_tools as list_mcp_tools, search_tools
-from .schemas import AgentChatBody, AgentModelsBody, AgentSettingsBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, ServerBody, ShortcutBody, TabBody, TransferBody, TrustBody, UploadInitBody
+from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
 from .searxng_backend import SearxNGService
-from .ssh import HostKeyRequired, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, file_info, parse_private_key, remove_recursive
+from .ssh import HostKeyRequired, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, detect_remote_os, file_info, parse_private_key, remove_recursive
 from .vault import Vault, VaultError
 
 
@@ -40,6 +44,8 @@ vault = Vault(db)
 sessions = SessionRegistry(db)
 uploads = UploadRegistry()
 agents = AgentRegistry()
+terminal_agents = AgentRegistry()
+agent_approvals = AgentApprovalRegistry()
 agent_workspace = AgentWorkspace(DATA / "workspace", sessions.get)
 searxng = SearxNGService()
 
@@ -56,7 +62,7 @@ async def lifespan(_: FastAPI):
         db.close()
 
 
-app = FastAPI(title="轻量 SSH 终端", lifespan=lifespan)
+app = FastAPI(title="CoShell", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -68,7 +74,7 @@ async def local_origin_only(request: Request, call_next):
 
 
 def public_server(row: dict[str, Any]) -> dict[str, Any]:
-    return {k: row.get(k) for k in ("id", "name", "host", "port", "username", "auth_type", "ssh_key_id", "note", "last_connected_at", "created_at", "updated_at")}
+    return {k: row.get(k) for k in ("id", "name", "host", "port", "username", "auth_type", "ssh_key_id", "note", "os_type", "last_connected_at", "created_at", "updated_at")}
 
 
 def server_credentials(row: dict[str, Any]) -> dict[str, Any]:
@@ -202,6 +208,33 @@ def delete_server(server_id: int, delete_workspace: bool = False):
         raise HTTPException(409, f"无法删除服务器 workspace：{exc}") from exc
     db.execute("DELETE FROM servers WHERE id=?", (server_id,))
     return {"ok": True, "workspace_deleted": workspace_deleted}
+
+
+def _open_in_explorer(path: Path) -> None:
+    """在系统资源管理器中打开指定文件夹，跨平台。"""
+    path_str = str(path)
+    if sys.platform == "win32":
+        os.startfile(path_str)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path_str])
+    else:
+        subprocess.Popen(["xdg-open", path_str])
+
+
+@app.post("/api/servers/{server_id}/workspace/open")
+def open_server_workspace(server_id: int):
+    if not db.fetchone("SELECT id FROM servers WHERE id=?", (server_id,)):
+        raise HTTPException(404, "服务器不存在")
+    directory = agent_workspace.server_root(server_id)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(409, f"无法创建 workspace 目录：{exc}") from exc
+    try:
+        _open_in_explorer(directory)
+    except OSError as exc:
+        raise HTTPException(500, f"无法打开 workspace 文件夹：{exc}") from exc
+    return {"ok": True, "path": str(directory)}
 
 
 def public_ssh_key(row: dict[str, Any]) -> dict[str, Any]:
@@ -462,7 +495,7 @@ async def agent_models(body: AgentModelsBody):
         raise HTTPException(400, str(exc)) from exc
 
 
-def execute_agent_command(session_id: str, command: str, timeout: int, on_output=None) -> dict[str, Any]:
+def execute_agent_command(session_id: str, command: str, timeout: int, on_output=None, cancel_event: threading.Event | None = None) -> dict[str, Any]:
     if len(command) > 20000:
         raise ValueError("命令过长")
     session = sessions.get(session_id)
@@ -474,6 +507,9 @@ def execute_agent_command(session_id: str, command: str, timeout: int, on_output
     error = bytearray()
     limit = 32 * 1024
     while not channel.exit_status_ready() or channel.recv_ready() or channel.recv_stderr_ready():
+        if cancel_event and cancel_event.is_set():
+            channel.close()
+            raise AgentCancelled("Agent 任务已停止")
         if time.monotonic() > deadline:
             channel.close()
             return {"exit_code": -1, "stdout": output.decode("utf-8", "replace"), "stderr": "命令执行超时"}
@@ -501,6 +537,37 @@ def execute_agent_command(session_id: str, command: str, timeout: int, on_output
     return result
 
 
+def agent_command_approver(
+    session_id: str,
+    permission_mode: str,
+    emit=None,
+    cancel_event: threading.Event | None = None,
+    approval_scope: str = "sidebar",
+):
+    """Build a per-task gate that pauses only recognized high-risk commands."""
+    def approve(command: str) -> bool:
+        risk = classify_dangerous_command(command)
+        if not risk or permission_mode == "full_access":
+            return True
+        # Non-streaming compatibility callers cannot present an approval UI, so
+        # request-approval mode safely rejects the destructive command.
+        if not emit:
+            return False
+        approval_id = agent_approvals.create(session_id, approval_scope)
+        emit({
+            "type": "command_approval_required",
+            "approval_id": approval_id,
+            "command": command,
+            "category": risk.category,
+            "reason": risk.reason,
+        })
+        approved = agent_approvals.wait(approval_id, cancel_event)
+        emit({"type": "command_approval_resolved", "approval_id": approval_id, "approved": approved})
+        return approved
+
+    return approve
+
+
 def agent_message_with_terminal_context(message: str, terminal_context: str | None) -> str:
     context = (terminal_context or "").strip()
     if not context:
@@ -517,18 +584,21 @@ def agent_message_with_terminal_context(message: str, terminal_context: str | No
 
 @app.post("/api/agent/chat")
 async def agent_chat(body: AgentChatBody):
+    """Compatibility endpoint for a single terminal quick-fix request."""
     try:
         sessions.get(body.session_id)
         config = agent_setting_row()
         if not config:
             raise AgentError("请先在设置中配置 Agent")
         key = agent_api_key()
+        terminal_agents.clear(body.session_id)
         return await asyncio.to_thread(
-            agents.chat, body.session_id, agent_message_with_terminal_context(body.message, body.terminal_context), config["api_url"], key, config["model"],
+            terminal_agents.chat, body.session_id, agent_message_with_terminal_context(body.message, body.terminal_context), config["api_url"], key, config["model"],
             lambda command, timeout: execute_agent_command(body.session_id, command, timeout),
+            command_approver=agent_command_approver(body.session_id, body.permission_mode, approval_scope="terminal"),
             builtin_web_search=bool(config.get("builtin_web_search", 1)),
             mcp_tools=enabled_mcp_tools(), mcp_executor=execute_mcp_tool,
-            local_executor=lambda tool, arguments: agent_workspace.execute(body.session_id, tool, arguments),
+            system_prompt=QUICK_FIX_SYSTEM_PROMPT, max_rounds=12,
         )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -540,7 +610,7 @@ async def agent_chat(body: AgentChatBody):
 
 @app.post("/api/agent/chat/stream")
 async def agent_chat_stream(body: AgentChatBody):
-    """Stream Agent activity as NDJSON while keeping the SSH terminal output-only."""
+    """Stream the persistent sidebar conversation without writing into the terminal."""
     try:
         sessions.get(body.session_id)
         config = agent_setting_row()
@@ -558,6 +628,7 @@ async def agent_chat_stream(body: AgentChatBody):
     async def events():
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        cancel_event = threading.Event()
 
         def emit(event: dict[str, Any]) -> None:
             loop.call_soon_threadsafe(queue.put_nowait, event)
@@ -566,18 +637,22 @@ async def agent_chat_stream(body: AgentChatBody):
             return execute_agent_command(
                 body.session_id, command, timeout,
                 lambda stream, data: emit({"type": "command_output", "stream": stream, "data": data}),
+                cancel_event,
             )
 
         def work() -> None:
             try:
                 result = agents.chat(
-                    body.session_id, body.message, config["api_url"], key, config["model"], execute,
+                    body.session_id, agent_message_with_terminal_context(body.message, body.terminal_context), config["api_url"], key, config["model"], execute,
                     builtin_web_search=bool(config.get("builtin_web_search", 1)),
                     mcp_tools=tools, mcp_executor=execute_mcp_tool,
                     local_executor=lambda tool, arguments: agent_workspace.execute(body.session_id, tool, arguments),
-                    on_event=emit, stream_response=True,
+                    command_approver=agent_command_approver(body.session_id, body.permission_mode, emit, cancel_event),
+                    on_event=emit, stream_response=True, cancel_event=cancel_event,
                 )
                 emit({"type": "answer", "message": result["message"], "limit_reached": bool(result.get("limit_reached"))})
+            except AgentCancelled:
+                emit({"type": "cancelled", "message": "任务已停止"})
             except (AgentError, VaultError, KeyError, ValueError, OSError) as exc:
                 emit({"type": "error", "message": str(exc)})
             finally:
@@ -591,7 +666,102 @@ async def agent_chat_stream(body: AgentChatBody):
                 if event["type"] == "done":
                     break
         finally:
-            await task
+            cancel_event.set()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+@app.post("/api/agent/chat/reset")
+def agent_chat_reset(body: AgentSessionBody):
+    agent_approvals.cancel_session(body.session_id, "sidebar")
+    agents.clear(body.session_id)
+    return {"ok": True}
+
+
+@app.post("/api/agent/approval")
+def agent_approval(body: AgentApprovalBody):
+    if not agent_approvals.resolve(body.session_id, body.approval_id, body.approved):
+        raise HTTPException(404, "授权请求已失效或不属于当前会话")
+    return {"ok": True}
+
+
+@app.post("/api/agent/quick-fix/reset")
+def terminal_agent_reset(body: AgentSessionBody):
+    agent_approvals.cancel_session(body.session_id, "terminal")
+    terminal_agents.clear(body.session_id)
+    return {"ok": True}
+
+
+@app.post("/api/agent/quick-fix/stream")
+async def terminal_agent_stream(body: TerminalAgentBody):
+    """Handle a short-lived terminal incident isolated from sidebar chat history."""
+    try:
+        sessions.get(body.session_id)
+        config = agent_setting_row()
+        if not config:
+            raise AgentError("请先在设置中配置 Agent")
+        key = agent_api_key()
+        if not body.continue_incident:
+            terminal_agents.clear(body.session_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except VaultError as exc:
+        raise HTTPException(423, "保险库已锁定，无法读取 Agent 凭据") from exc
+    except AgentError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    async def events():
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        cancel_event = threading.Event()
+
+        def emit(event: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        def execute(command: str, timeout: int) -> dict[str, Any]:
+            return execute_agent_command(
+                body.session_id, command, min(timeout, 300),
+                lambda stream, data: emit({"type": "command_output", "stream": stream, "data": data}),
+                cancel_event,
+            )
+
+        def work() -> None:
+            try:
+                message = agent_message_with_terminal_context(body.message, body.terminal_context)
+                if body.explain_only:
+                    message += "\n\n本次为只读解释模式：可以执行必要的只读检查，但不要修改远程主机。"
+                result = terminal_agents.chat(
+                    body.session_id, message, config["api_url"], key, config["model"], execute,
+                    builtin_web_search=bool(config.get("builtin_web_search", 1)),
+                    command_approver=agent_command_approver(body.session_id, body.permission_mode, emit, cancel_event, "terminal"),
+                    on_event=emit, stream_response=True, system_prompt=QUICK_FIX_SYSTEM_PROMPT,
+                    max_rounds=12, cancel_event=cancel_event,
+                )
+                emit({"type": "answer", "message": result["message"], "limit_reached": bool(result.get("limit_reached"))})
+            except AgentCancelled:
+                emit({"type": "cancelled", "message": "终端 Agent 已停止"})
+            except (AgentError, VaultError, KeyError, ValueError, OSError) as exc:
+                emit({"type": "error", "message": str(exc)})
+            finally:
+                emit({"type": "done"})
+
+        task = asyncio.create_task(asyncio.to_thread(work))
+        try:
+            while True:
+                event = await queue.get()
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+                if event["type"] == "done":
+                    break
+        finally:
+            cancel_event.set()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
@@ -650,6 +820,7 @@ def system_info(session_id: str):
         # server dropped a transport which was still cached as a live session.
         uploads.close_for_session(session_id)
         agents.clear(session_id)
+        terminal_agents.clear(session_id)
         sessions.close(session_id)
         raise HTTPException(410, "SSH 会话已断开") from exc
     except (OSError, ValueError) as exc:
@@ -970,7 +1141,15 @@ async def terminal_socket(ws: WebSocket):
                            (required.host, required.port, required.key.get_name(), required.fingerprint, required.key.get_base64()))
                 data["trusted_host_key"] = required.key
         if first.get("server_id") is not None:
-            db.execute("UPDATE servers SET last_connected_at=CURRENT_TIMESTAMP WHERE id=?", (int(first["server_id"]),))
+            server_id = int(first["server_id"])
+            saved_server = db.fetchone("SELECT os_type FROM servers WHERE id=?", (server_id,))
+            os_type = saved_server.get("os_type", "default") if saved_server else "default"
+            if os_type == "default":
+                try:
+                    os_type = await asyncio.to_thread(detect_remote_os, session)
+                except (OSError, EOFError, AttributeError, paramiko.SSHException):
+                    os_type = "default"
+            db.execute("UPDATE servers SET last_connected_at=CURRENT_TIMESTAMP,os_type=? WHERE id=?", (os_type, server_id))
         await ws.send_json({"type": "connected", "session_id": session.id})
 
         async def send_output():
@@ -1021,6 +1200,7 @@ async def terminal_socket(ws: WebSocket):
         if session:
             uploads.close_for_session(session.id)
             agents.clear(session.id)
+            terminal_agents.clear(session.id)
             sessions.close(session.id)
         try: await ws.close()
         except Exception: pass

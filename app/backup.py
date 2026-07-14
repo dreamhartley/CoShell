@@ -17,7 +17,7 @@ MAX_BACKUP_BYTES = 16 * 1024 * 1024
 TABLES: dict[str, tuple[str, ...]] = {
     "vault": ("id", "salt", "verifier", "created_at"),
     "ssh_keys": ("id", "name", "key_type", "fingerprint", "private_key_enc", "passphrase_enc", "created_at"),
-    "servers": ("id", "name", "host", "port", "username", "auth_type", "password_enc", "private_key_enc", "passphrase_enc", "note", "last_connected_at", "created_at", "updated_at", "ssh_key_id"),
+    "servers": ("id", "name", "host", "port", "username", "auth_type", "password_enc", "private_key_enc", "passphrase_enc", "note", "os_type", "last_connected_at", "created_at", "updated_at", "ssh_key_id"),
     "shortcuts": ("id", "name", "command", "group_name", "sort_order", "created_at", "updated_at"),
     "host_keys": ("host", "port", "algorithm", "fingerprint", "key_base64", "trusted_at"),
     "terminal_tabs": ("id", "title", "server_id", "position", "last_path"),
@@ -72,7 +72,7 @@ def parse_backup(content: bytes) -> dict[str, list[dict[str, Any]]]:
     try:
         document = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise BackupError("请选择有效的 Light SSH Terminal JSON 备份文件") from exc
+        raise BackupError("请选择有效的 CoShell JSON 备份文件") from exc
     if not isinstance(document, dict) or document.get("format") != FORMAT or document.get("version") != VERSION:
         raise BackupError("备份文件格式或版本不受支持")
     raw_tables = document.get("tables")
@@ -85,6 +85,9 @@ def parse_backup(content: bytes) -> dict[str, list[dict[str, Any]]]:
             raise BackupError(f"备份文件中的 {table} 数据无效")
         decoded: list[dict[str, Any]] = []
         for row in raw_rows:
+            # Backups made before host OS icons existed have no os_type field.
+            if table == "servers" and isinstance(row, dict) and set(row) == set(columns) - {"os_type"}:
+                row = {**row, "os_type": "default"}
             if not isinstance(row, dict) or set(row) != set(columns):
                 raise BackupError(f"备份文件中的 {table} 字段不匹配")
             decoded.append({column: _decode(row[column]) for column in columns})

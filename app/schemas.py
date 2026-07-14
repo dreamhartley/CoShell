@@ -105,3 +105,23 @@ class AgentChatBody(BaseModel):
     session_id: str
     message: str = Field(min_length=1, max_length=20000)
     terminal_context: str | None = Field(default=None, max_length=30000)
+    permission_mode: Literal["request_approval", "full_access"] = "request_approval"
+
+
+class TerminalAgentBody(BaseModel):
+    session_id: str
+    message: str = Field(min_length=1, max_length=20000)
+    terminal_context: str | None = Field(default=None, max_length=20000)
+    continue_incident: bool = False
+    explain_only: bool = False
+    permission_mode: Literal["request_approval", "full_access"] = "request_approval"
+
+
+class AgentSessionBody(BaseModel):
+    session_id: str
+
+
+class AgentApprovalBody(BaseModel):
+    session_id: str
+    approval_id: str = Field(min_length=16, max_length=64)
+    approved: bool

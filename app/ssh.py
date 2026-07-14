@@ -83,6 +83,52 @@ class SSHSession:
                 pass
 
 
+OS_ALIASES = {
+    "ubuntu": "ubuntu", "debian": "debian", "raspbian": "debian", "kali": "kali",
+    "fedora": "fedora", "centos": "centos", "rhel": "rhel", "redhat": "rhel",
+    "rocky": "rocky", "almalinux": "alma", "alma": "alma", "ol": "oracle",
+    "arch": "arch", "manjaro": "arch", "endeavouros": "arch",
+    "alpine": "alpine", "opensuse": "opensuse", "sles": "opensuse", "suse": "opensuse",
+    "gentoo": "gentoo", "void": "void", "linuxmint": "mint", "mint": "mint",
+    "amzn": "amazon", "amazon": "amazon", "freebsd": "freebsd", "darwin": "macos",
+    "windows": "windows",
+}
+
+
+def normalize_remote_os(output: str) -> str:
+    """Turn /etc/os-release (or uname fallback) into a stable icon identifier."""
+    values: dict[str, str] = {}
+    for raw_line in output[:32768].splitlines():
+        if "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        values[key.strip().upper()] = value.strip().strip("'\"").lower()
+    candidates = [values.get("ID", ""), *values.get("ID_LIKE", "").replace(",", " ").split()]
+    for candidate in candidates:
+        canonical = OS_ALIASES.get(candidate)
+        if canonical:
+            return canonical
+    lowered = output.lower()
+    for candidate, canonical in OS_ALIASES.items():
+        if candidate in lowered:
+            return canonical
+    return "linux" if "linux" in lowered or values else "default"
+
+
+def detect_remote_os(session: SSHSession) -> str:
+    command = "LC_ALL=C sh -c 'if [ -r /etc/os-release ]; then cat /etc/os-release; else echo ID=$(uname -s 2>/dev/null); fi'"
+    _, stdout, stderr = session.client.exec_command(command, timeout=3)
+    output = stdout.read(32768).decode("utf-8", "replace")
+    if not output:
+        error = stderr.read(4096).decode("utf-8", "replace").strip()
+        # Windows OpenSSH normally starts cmd.exe instead of a POSIX shell.
+        _, windows_stdout, _ = session.client.exec_command("cmd /c ver", timeout=3)
+        output = windows_stdout.read(4096).decode("utf-8", "replace")
+        if not output and error:
+            raise OSError(error)
+    return normalize_remote_os(output)
+
+
 class SessionRegistry:
     def __init__(self, db: Database):
         self.db = db

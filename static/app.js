@@ -1,6 +1,7 @@
 const $ = (q, root=document) => root.querySelector(q);
 const $$ = (q, root=document) => [...root.querySelectorAll(q)];
-const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}};
+const storedSidebarAgentPermissionMode=sessionStorage.getItem('coshell-sidebar-agent-permission-mode');
+const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, sidebarAgentPermissionMode:storedSidebarAgentPermissionMode==='full_access'?'full_access':'request_approval', sidebarAgentPermissionPrompt:false, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}};
 
 async function api(path, options={}) {
   const res = await fetch(path, {headers: options.body instanceof FormData ? {} : {'Content-Type':'application/json'}, ...options});
@@ -84,15 +85,108 @@ function renderAgentMarkdown(value=''){
   }
   if(inCode)output.push('\x1b[0m');return output.join('\r\n')
 }
-function recentTerminalContext(tab,command=''){
-  const buffer=tab.term.buffer.active,end=Math.min(buffer.length,buffer.baseY+buffer.cursorY+1),start=Math.max(0,end-240);let text='';
-  for(let index=start;index<end;index++){const line=buffer.getLine(index);if(!line)continue;const value=line.translateToString(true);if(text&&!line.isWrapped)text+='\n';text+=value}
-  text=text.trimEnd();if(command&&text.endsWith(command))text=text.slice(0,-command.length).trimEnd();return text.slice(-30000)
+function redactTerminalContext(value=''){
+  let count=0,text=String(value);const replace=(pattern,replacer)=>{text=text.replace(pattern,(...args)=>{count++;return typeof replacer==='function'?replacer(...args):replacer})};
+  replace(/-----BEGIN [^-]*(?:PRIVATE KEY|OPENSSH PRIVATE KEY)-----[\s\S]*?-----END [^-]*(?:PRIVATE KEY|OPENSSH PRIVATE KEY)-----/gi,'[已隐藏私钥]');
+  replace(/\b(authorization\s*:\s*(?:bearer|basic)\s+)[^\s]+/gi,(_,prefix)=>`${prefix}[已隐藏]`);
+  replace(/\b((?:api[_-]?key|access[_-]?token|secret|password|passwd|pwd)\s*[=:]\s*)[^\s'";]+/gi,(_,prefix)=>`${prefix}[已隐藏]`);
+  return {text,count}
 }
-async function runAgent(tab,message,terminalContext=''){
-  if(!message.trim()){tab.term.writeln('\x1b[33m用法：/agent 描述你希望完成的任务\x1b[0m');return}
-  tab.agentBusy=true;renderAgentChat();tab.term.writeln(`\x1b[38;5;111m[Agent 正在分析并操作远程主机${terminalContext?'，已附带终端上下文':''}…]\x1b[0m`);
-  try{const result=await api('/api/agent/chat',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,message,terminal_context:terminalContext||null})});for(const step of result.steps||[]){if(step.search){tab.term.writeln(`\r\n\x1b[90m[在线搜索] ${terminalText(step.search)}（${step.result_count} 条结果）\x1b[0m`);continue}if(step.fetch){tab.term.writeln(`\r\n\x1b[90m[网页读取] ${terminalText(step.title||step.fetch)} · ${step.link_count} 个链接${step.truncated?' · 正文已截断':''}\x1b[0m`);continue}if(step.mcp){tab.term.writeln(`\r\n\x1b[90m[MCP 搜索] ${terminalText(step.mcp)} · ${terminalText(step.tool)}\x1b[0m`);continue}if(step.tool){tab.term.writeln(`\r\n\x1b[90m[Agent 工具] ${terminalText(step.tool)} · ${terminalText(step.local_path||step.path||step.remote_path||'workspace')}\x1b[0m`);continue}tab.term.writeln(`\r\n\x1b[1;38;5;111m┌─ 执行命令\x1b[0m\r\n${renderAgentCommand(step.command)}`);if(step.stdout){tab.term.write('\x1b[90m├─ 输出\x1b[0m\r\n');tab.term.write(terminalLines(step.stdout).join('\r\n'))}if(step.stderr){if(step.stdout)tab.term.write('\r\n');tab.term.write('\x1b[31m├─ 错误输出\x1b[0m\r\n');tab.term.write(`\x1b[31m${terminalLines(step.stderr).join('\r\n')}\x1b[0m`)}const failed=Number(step.exit_code)!==0,color=failed?'31':'90',symbol=failed?'失败':'完成';tab.term.writeln(`\r\n\x1b[${color}m└─ ${symbol} · 退出码 ${step.exit_code}${step.truncated?' · 输出已截断':''}\x1b[0m`)}if(result.limit_reached)tab.term.writeln('\r\n\x1b[33m[本次执行已达到 30 轮，下面是当前进度；可继续发送 /agent 继续]\x1b[0m');tab.term.writeln(`\r\n\x1b[38;5;111mAgent:\x1b[0m ${renderAgentMarkdown(result.message)}`)}catch(err){tab.term.writeln(`\r\n\x1b[31m[Agent] ${terminalText(err.message)}\x1b[0m`);toast(err.message,true)}finally{tab.agentBusy=false;renderAgentChat();tab.term.write('\r\n');rawTerminalInput(tab,'\r');tab.term.focus()}
+function terminalBufferText(tab,start,end){const buffer=tab.term.buffer.active;let text='',lines=0;for(let index=Math.max(0,start);index<Math.min(end,buffer.length);index++){const line=buffer.getLine(index);if(!line)continue;const value=line.translateToString(true);if(text&&!line.isWrapped){text+='\n';lines++}text+=value}return {text:text.trimEnd(),lines:Math.max(lines,text?1:0)}}
+function recentTerminalContext(tab,command=''){
+  const selected=tab.term.hasSelection?.()?tab.term.getSelection().trim():'';let raw,source;
+  if(selected){raw={text:selected,lines:selected.split(/\r?\n/).length};source='selection'}else{const buffer=tab.term.buffer.active,end=Math.min(buffer.length,buffer.baseY+buffer.cursorY+1),start=tab.lastCommandStart===null?Math.max(0,end-120):Math.max(tab.lastCommandStart,end-120);raw=terminalBufferText(tab,start,end);source=tab.lastCommandStart===null?'recent':'last_command'}
+  let text=raw.text;if(command&&text.endsWith(command))text=text.slice(0,-command.length).trimEnd();text=text.slice(-20000);const redacted=redactTerminalContext(text);return {text:redacted.text,lineCount:redacted.text?redacted.text.split('\n').length:0,source,redactions:redacted.count}
+}
+function parseTerminalAgentRequest(value=''){
+  let message=value.trim(),explainOnly=false,noContext=false,continueIncident=false;
+  if(/^--explain(?:\s|$)/i.test(message)){explainOnly=true;message=message.replace(/^--explain\s*/i,'')}
+  if(/^--no-context(?:\s|$)/i.test(message)){noContext=true;message=message.replace(/^--no-context\s*/i,'')}
+  if(/^(?:继续|continue)(?:[\s,，:：]|$)/i.test(message)){continueIncident=true;message=message.replace(/^(?:继续|continue)[\s,，:：]*/i,'').trim()||'继续处理刚才的终端故障并验证结果'}
+  return {message,explainOnly,noContext,continueIncident}
+}
+function terminalAgentPermissionModeLabel(mode){return mode==='full_access'?'完全访问模式':'请求批准模式'}
+const TERMINAL_AGENT_COMPLETIONS=[
+  {value:'--explain ',label:'--explain',description:'只读分析和解释终端问题'},
+  {value:'--no-context ',label:'--no-context',description:'不附带最近终端输出'},
+  {value:'继续 ',label:'继续',description:'继续处理最近一次终端故障'},
+  {value:'mode',label:'mode',description:'查看当前终端 Agent 权限模式'},
+  {value:'mode approval',label:'mode approval',description:'高风险命令执行前请求批准'},
+  {value:'mode full',label:'mode full',description:'完全访问，执行命令时不请求批准'},
+  {value:'clear',label:'clear',description:'清除终端 Agent 临时故障上下文'},
+];
+function createTerminalAgentAutocomplete(tab){
+  const root=document.createElement('div');root.className='terminal-agent-autocomplete hidden';root.setAttribute('role','listbox');root.setAttribute('aria-label','Agent 子命令');
+  const title=document.createElement('div');title.className='terminal-agent-autocomplete-title';title.textContent='Agent 子命令';root.append(title);
+  TERMINAL_AGENT_COMPLETIONS.forEach((item,index)=>{const button=document.createElement('button');button.type='button';button.className='terminal-agent-autocomplete-option';button.setAttribute('role','option');const command=document.createElement('code');command.textContent=item.label;const description=document.createElement('span');description.textContent=item.description;button.append(command,description);button.onpointerdown=event=>event.preventDefault();button.onmouseenter=()=>{tab.agentAutocompleteIndex=index;renderTerminalAgentAutocompleteSelection(tab)};button.onclick=()=>selectTerminalAgentAutocomplete(tab,index);root.append(button)});
+  tab.host.append(root);tab.agentAutocomplete=root
+}
+function renderTerminalAgentAutocompleteSelection(tab){
+  $$('.terminal-agent-autocomplete-option',tab.agentAutocomplete).forEach((option,index)=>{const selected=index===tab.agentAutocompleteIndex;option.classList.toggle('selected',selected);option.setAttribute('aria-selected',String(selected))})
+}
+function positionTerminalAgentAutocomplete(tab){
+  const root=tab.agentAutocomplete,screen=$('.xterm-screen',tab.host);if(!root||!screen||!tab.agentAutocompleteOpen)return;const hostRect=tab.host.getBoundingClientRect(),screenRect=screen.getBoundingClientRect(),cellWidth=screenRect.width/Math.max(1,tab.term.cols),cellHeight=screenRect.height/Math.max(1,tab.term.rows),buffer=tab.term.buffer.active,startColumn=Math.max(0,buffer.cursorX-terminalCellWidth('/agent '));let left=screenRect.left-hostRect.left+startColumn*cellWidth,top=screenRect.top-hostRect.top+(buffer.cursorY+1)*cellHeight;left=Math.max(8,Math.min(left,hostRect.width-root.offsetWidth-8));root.classList.remove('above');if(top+root.offsetHeight>hostRect.height-8){top=Math.max(8,screenRect.top-hostRect.top+buffer.cursorY*cellHeight-root.offsetHeight-4);root.classList.add('above')}root.style.left=`${left}px`;root.style.top=`${top}px`;root.style.visibility='visible'
+}
+function showTerminalAgentAutocomplete(tab){
+  if(tab.id!==state.activeId||tab.agentBuffer!=='/agent '||!tab.agentAutocomplete)return;tab.agentAutocompleteOpen=true;tab.agentAutocompleteIndex=0;tab.agentAutocomplete.classList.remove('hidden');tab.agentAutocomplete.style.visibility='hidden';renderTerminalAgentAutocompleteSelection(tab);requestAnimationFrame(()=>positionTerminalAgentAutocomplete(tab))
+}
+function hideTerminalAgentAutocomplete(tab){
+  if(!tab?.agentAutocomplete)return;tab.agentAutocompleteOpen=false;tab.agentAutocomplete.classList.add('hidden');tab.agentAutocomplete.style.visibility='';tab.agentAutocomplete.classList.remove('above')
+}
+function selectTerminalAgentAutocomplete(tab,index=tab.agentAutocompleteIndex){
+  if(!tab.agentAutocompleteOpen||tab.agentBuffer!=='/agent ')return;const item=TERMINAL_AGENT_COMPLETIONS[index];if(!item)return;tab.agentBuffer+=item.value;tab.term.write(item.value);hideTerminalAgentAutocomplete(tab);tab.term.focus()
+}
+function handleTerminalAgentAutocompleteKey(tab,data){
+  if(!tab.agentAutocompleteOpen)return false;
+  if(['\x1b[A','\x1bOA','\x1b[B','\x1bOB'].includes(data)){const direction=data.endsWith('A')?-1:1;tab.agentAutocompleteIndex=(tab.agentAutocompleteIndex+direction+TERMINAL_AGENT_COMPLETIONS.length)%TERMINAL_AGENT_COMPLETIONS.length;renderTerminalAgentAutocompleteSelection(tab);return true}
+  if(data==='\t'||data==='\r'||data==='\n'){selectTerminalAgentAutocomplete(tab);return true}
+  if(data==='\x1b'){hideTerminalAgentAutocomplete(tab);return true}
+  hideTerminalAgentAutocomplete(tab);return false
+}
+function handleTerminalAgentModeCommand(tab,message=''){
+  const match=message.trim().match(/^(?:mode|模式)(?:\s+(.*))?$/i);if(!match)return false;const value=(match[1]||'').trim().toLowerCase();
+  if(!value){tab.term.writeln(`\x1b[38;5;111m[终端 Agent 当前为${terminalAgentPermissionModeLabel(tab.quickAgentPermissionMode)}]\x1b[0m\r\n\x1b[90m切换：/agent mode approval 或 /agent mode full\x1b[0m`);return true}
+  if(['approval','request','request_approval','ask','请求批准','批准'].includes(value)){tab.quickAgentPermissionMode='request_approval';tab.term.writeln('\x1b[38;5;111m[终端 Agent 已切换为请求批准模式]\x1b[0m');return true}
+  if(['full','full_access','access','完全访问'].includes(value)){tab.quickAgentPermissionMode='full_access';tab.term.writeln('\x1b[33m[终端 Agent 已切换为完全访问模式；高风险命令将不再请求授权]\x1b[0m');return true}
+  tab.term.writeln('\x1b[31m[未知模式。请使用 /agent mode approval 或 /agent mode full]\x1b[0m');return true
+}
+async function answerTerminalAgentApproval(tab,approved){
+  const pending=tab.quickAgentApproval;if(!pending||pending.submitting)return;pending.submitting=true;try{await api('/api/agent/approval',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,approval_id:pending.approval_id,approved})});if(tab.quickAgentApproval===pending)tab.quickAgentApproval=null;tab.quickApprovalBuffer='';tab.term.writeln(`\x1b[${approved?'38;5;111':'33'}m[已${approved?'批准':'拒绝'}执行该命令]\x1b[0m`)}catch(err){pending.submitting=false;tab.term.writeln(`\x1b[31m[授权响应失败：${terminalText(err.message)}]\x1b[0m\r\n\x1b[1;33m请重新输入 是/否：\x1b[0m`)}
+}
+function handleTerminalAgentApprovalInput(tab,data){
+  if(data.includes('\x03')){tab.quickAgentAbort?.abort();return}
+  if(tab.quickAgentApproval?.submitting)return;
+  for(const char of data){
+    if(char==='\r'||char==='\n'){
+      const answer=(tab.quickApprovalBuffer||'').trim().toLowerCase();tab.quickApprovalBuffer='';tab.term.write('\r\n');
+      if(['是','y','yes'].includes(answer)){answerTerminalAgentApproval(tab,true);return}
+      if(['否','n','no'].includes(answer)){answerTerminalAgentApproval(tab,false);return}
+      tab.term.write('\x1b[33m请输入 是 或 否：\x1b[0m');continue
+    }
+    if(char==='\x7f'||char==='\b'){if(tab.quickApprovalBuffer)tab.quickApprovalBuffer=eraseLastLocalCharacter(tab.term,tab.quickApprovalBuffer);continue}
+    if(char>=' '){tab.quickApprovalBuffer=(tab.quickApprovalBuffer||'')+char;tab.term.write(char)}
+  }
+}
+async function resetTerminalAgent(tab){await api('/api/agent/quick-fix/reset',{method:'POST',body:JSON.stringify({session_id:tab.sessionId})});tab.quickIncidentCommandStart=null;tab.term.writeln('\x1b[90m[已清除终端 Agent 的临时故障上下文]\x1b[0m')}
+function handleTerminalAgentEvent(tab,event,state){
+  if(event.type==='thinking_start'&&!state.thinkingShown){state.thinkingShown=true;tab.term.writeln('\x1b[90m[分析] 正在定位故障原因…\x1b[0m')}
+  else if(event.type==='command_approval_required'){tab.quickAgentApproval={...event,submitting:false};tab.quickApprovalBuffer='';tab.term.writeln(`\r\n\x1b[1;33m[Agent 请求执行权限]\x1b[0m\r\n\x1b[33m${terminalText(event.reason||'该命令可能造成不可逆变更')}\x1b[0m\r\n${renderAgentCommand(event.command)}\r\n\x1b[1;33m是否允许执行？请输入 是/否：\x1b[0m`)}
+  else if(event.type==='command_approval_resolved'){if(tab.quickAgentApproval?.approval_id===event.approval_id){tab.quickAgentApproval=null;tab.quickApprovalBuffer=''}}
+  else if(event.type==='command_start'){state.commandOpen=true;tab.term.writeln(`\r\n\x1b[1;38;5;111m┌─ 检查或修复\x1b[0m\r\n${renderAgentCommand(event.command)}`)}
+  else if(event.type==='command_output'){const value=terminalText(event.data||'').replace(/\r?\n/g,'\r\n');if(value)tab.term.write(event.stream==='stderr'?`\x1b[31m${value}\x1b[0m`:value)}
+  else if(event.type==='command_end'){state.commandOpen=false;const failed=Number(event.exit_code)!==0;tab.term.writeln(`\r\n\x1b[${failed?'31':'90'}m└─ ${failed?'失败':'完成'} · 退出码 ${event.exit_code}\x1b[0m`)}
+  else if(event.type==='activity'){const names={search:'在线搜索',fetch:'读取网页'};tab.term.writeln(`\x1b[90m[${names[event.activity]||'辅助检查'}] ${terminalText(event.label)}\x1b[0m`)}
+  else if(event.type==='answer'){state.answerShown=true;tab.term.writeln(`\r\n\x1b[38;5;111mAgent:\x1b[0m ${renderAgentMarkdown(event.message)}${event.limit_reached?'\r\n\x1b[33m已达到本次快速处置上限，可使用 /agent 继续 接着处理。\x1b[0m':''}`)}
+  else if(event.type==='cancelled'){state.cancelled=true;tab.term.writeln('\r\n\x1b[33m[终端 Agent 已停止]\x1b[0m')}
+  else if(event.type==='error'){state.error=true;tab.term.writeln(`\r\n\x1b[31m[Agent] ${terminalText(event.message)}\x1b[0m`)}
+}
+async function runAgent(tab,value,context){
+  const request=parseTerminalAgentRequest(value);if(/^clear$/i.test(request.message)){try{await resetTerminalAgent(tab)}catch(err){tab.term.writeln(`\x1b[31m[Agent] ${terminalText(err.message)}\x1b[0m`)}finally{rawTerminalInput(tab,'\r')}return}
+  if(handleTerminalAgentModeCommand(tab,request.message)){rawTerminalInput(tab,'\r');return}
+  if(!request.message){tab.term.writeln('\x1b[33m用法：/agent 帮我解决这个报错 · /agent --explain 解释报错 · /agent mode · /agent clear\x1b[0m');rawTerminalInput(tab,'\r');return}
+  const noNewContext=request.continueIncident&&tab.quickIncidentCommandStart===tab.lastCommandStart;const terminalContext=request.noContext||noNewContext?{text:'',lineCount:0,source:'none',redactions:0}:context;if(!request.continueIncident)tab.quickIncidentCommandStart=tab.lastCommandStart;tab.quickAgentBusy=true;tab.quickAgentAbort=new AbortController();const progress={thinkingShown:false,answerShown:false,cancelled:false,error:false,commandOpen:false};
+  const sourceName=terminalContext.source==='selection'?'选中内容':terminalContext.source==='last_command'?'上一条命令现场':'最近终端输出';tab.term.writeln(`\x1b[38;5;111m[终端 Agent · ${terminalAgentPermissionModeLabel(tab.quickAgentPermissionMode)} · ${terminalContext.text?`已附带${sourceName} ${terminalContext.lineCount} 行${terminalContext.redactions?`，隐藏 ${terminalContext.redactions} 处敏感信息`:''}`:'未附带终端上下文'} · Ctrl+C 停止]\x1b[0m`);
+  renderAgentChat();try{const response=await fetch('/api/agent/quick-fix/stream',{method:'POST',headers:{'Content-Type':'application/json'},signal:tab.quickAgentAbort.signal,body:JSON.stringify({session_id:tab.sessionId,message:request.message,terminal_context:terminalContext.text||null,continue_incident:request.continueIncident,explain_only:request.explainOnly,permission_mode:tab.quickAgentPermissionMode})});if(!response.ok){let detail=response.statusText;try{detail=(await response.json()).detail||detail}catch{}throw new Error(detail)}if(!response.body)throw new Error('当前环境不支持流式响应');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const {value:chunk,done}=await reader.read();buffer+=decoder.decode(chunk||new Uint8Array(),{stream:!done});const lines=buffer.split('\n');buffer=lines.pop()||'';for(const line of lines)if(line.trim())handleTerminalAgentEvent(tab,JSON.parse(line),progress);if(done)break}if(buffer.trim())handleTerminalAgentEvent(tab,JSON.parse(buffer),progress)}catch(err){if(err.name!=='AbortError')tab.term.writeln(`\r\n\x1b[31m[Agent] ${terminalText(err.message)}\x1b[0m`);else if(!progress.cancelled)tab.term.writeln('\r\n\x1b[33m[正在停止终端 Agent…]\x1b[0m')}finally{tab.quickAgentBusy=false;tab.quickAgentAbort=null;tab.quickAgentApproval=null;tab.quickApprovalBuffer='';renderAgentChat();tab.term.write('\r\n');rawTerminalInput(tab,'\r');tab.term.focus()}
 }
 function agentEntry(tab,entry){tab.agentChat.push(entry);renderAgentChat();return entry}
 function agentProcessLabel(process){const seconds=Math.max(0,Math.round(((process.completedAt||Date.now())-process.startedAt)/1000));return `${process.status==='running'?'处理中':process.status==='failed'?'处理失败':'已处理'} ${seconds}s`}
@@ -103,38 +197,49 @@ function startAgentProcess(tab){
 function completeAgentProcess(tab,status='done'){const process=tab.agentProcess;if(!process||process.status!=='running')return;process.status=status;process.completedAt=Date.now();process.open=false;if(process.currentThinking){process.currentThinking.status=status==='failed'?'failed':'done';process.currentThinking.text=status==='failed'?'思考中断':'思考完成';process.currentThinking=null}if(tab.agentProcessTimer){clearInterval(tab.agentProcessTimer);tab.agentProcessTimer=null}}
 function renderAgentProcess(process){
   const root=document.createElement('section');root.className=`agent-process ${process.status}`;root.dataset.processId=process.id;const toggle=document.createElement('button');toggle.type='button';toggle.className='agent-process-toggle';toggle.setAttribute('aria-expanded',String(process.open));const label=document.createElement('span');label.className='agent-process-label';label.textContent=agentProcessLabel(process);const chevron=document.createElement('span');chevron.className='agent-process-chevron';chevron.setAttribute('aria-hidden','true');toggle.append(label,chevron);const body=document.createElement('div');body.className='agent-process-body';body.hidden=!process.open;
-  for(const item of process.items){if(item.type==='text'){const note=document.createElement('div');note.className='agent-process-note';note.append(renderAgentChatMarkdown(item.text));body.append(note);continue}const row=document.createElement('div');row.className=`agent-activity ${item.status||''}${item.type==='command'?' agent-command':''}`;row.textContent=item.text;row.title=item.text;body.append(row)}
+  for(const item of process.items){if(item.type==='text'){const note=document.createElement('div');note.className='agent-process-note';note.append(renderAgentChatMarkdown(item.text));body.append(note);continue}const row=document.createElement('div');row.className=`agent-activity ${item.status||''}${item.type==='command'?' agent-command':''}`;const label=document.createElement('span');label.className='agent-activity-label';label.textContent=item.text;label.title=item.text;row.append(label);if(item.output){const output=document.createElement('pre');output.className='agent-command-output';output.textContent=item.output;row.append(output)}body.append(row)}
   toggle.onclick=()=>{process.open=!process.open;body.hidden=!process.open;toggle.setAttribute('aria-expanded',String(process.open))};root.append(toggle,body);return root
 }
 function appendAgentMarkdownInline(parent,text){
   const pattern=/(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_([^_\n]+)_|\[[^\]\n]+\]\([^)\n]+\))/g;let cursor=0,match;
   while((match=pattern.exec(text))){if(match.index>cursor)parent.append(document.createTextNode(text.slice(cursor,match.index)));const token=match[0];let node;if(token.startsWith('`')){node=document.createElement('code');node.textContent=token.slice(1,-1)}else if(token.startsWith('**')||token.startsWith('__')){node=document.createElement('strong');node.textContent=token.slice(2,-2)}else if(token.startsWith('*')||token.startsWith('_')){node=document.createElement('em');node.textContent=token.slice(1,-1)}else{const parts=token.match(/^\[([^\]]+)\]\(([^)]+)\)$/),url=parts?.[2]?.trim()||'';if(/^https?:\/\//i.test(url)){node=document.createElement('a');node.href=url;node.target='_blank';node.rel='noopener noreferrer';node.textContent=parts[1]}else node=document.createTextNode(token)}parent.append(node);cursor=match.index+token.length}if(cursor<text.length)parent.append(document.createTextNode(text.slice(cursor)))
 }
-function agentTableCells(line){const value=line.trim();if(!value.includes('|'))return null;return value.replace(/^\|/,'').replace(/\|$/,'').split('|').map(cell=>cell.trim())}
+function agentTableCells(line){let value=line.trim();if(!value.includes('|'))return null;if(value.startsWith('|'))value=value.slice(1);if(value.endsWith('|'))value=value.slice(0,-1);const cells=[];let cell='',escaped=false;for(const char of value){if(escaped){cell+=char;escaped=false;continue}if(char==='\\'){cell+=char;escaped=true;continue}if(char==='|'){cells.push(cell.trim());cell='';continue}cell+=char}cells.push(cell.trim());return cells}
+function agentTableBlock(lines,index){const header=agentTableCells(lines[index]||''),alignment=agentTableCells(lines[index+1]||'');return header&&alignment&&alignment.length===header.length&&alignment.every(cell=>/^:?-{3,}:?$/.test(cell))?{header,alignment}:null}
 function renderAgentChatMarkdown(value=''){
   const root=document.createElement('div');root.className='agent-markdown';const lines=String(value).replace(/\r\n?/g,'\n').split('\n');
-  for(let i=0;i<lines.length;){const line=lines[i];if(!line.trim()){i++;continue}const fence=line.match(/^\s*```\s*([^ ]*)\s*$/);if(fence){const pre=document.createElement('pre'),code=document.createElement('code');code.dataset.language=fence[1]||'';const body=[];i++;while(i<lines.length&&!/^\s*```/.test(lines[i]))body.push(lines[i++]);if(i<lines.length)i++;code.textContent=body.join('\n');pre.append(code);root.append(pre);continue}const heading=line.match(/^\s*(#{1,4})\s+(.+)$/);if(heading){const el=document.createElement(`h${heading[1].length}`);appendAgentMarkdownInline(el,heading[2]);root.append(el);i++;continue}if(/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)){root.append(document.createElement('hr'));i++;continue}const header=agentTableCells(line),alignment=i+1<lines.length?agentTableCells(lines[i+1]):null;if(header&&alignment&&alignment.length===header.length&&alignment.every(cell=>/^:?-{3,}:?$/.test(cell))){const table=document.createElement('table'),thead=document.createElement('thead'),headRow=document.createElement('tr');header.forEach(cell=>{const th=document.createElement('th');appendAgentMarkdownInline(th,cell);headRow.append(th)});thead.append(headRow);table.append(thead);const tbody=document.createElement('tbody');i+=2;while(i<lines.length){const cells=agentTableCells(lines[i]);if(!cells)break;const tr=document.createElement('tr');header.forEach((_,index)=>{const td=document.createElement('td');appendAgentMarkdownInline(td,cells[index]||'');tr.append(td)});tbody.append(tr);i++}table.append(tbody);root.append(table);continue}const list=line.match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);if(list){const ordered=!!list[2],el=document.createElement(ordered?'ol':'ul');while(i<lines.length){const item=lines[i].match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);if(!item||!!item[2]!==ordered)break;const li=document.createElement('li');appendAgentMarkdownInline(li,item[3]);el.append(li);i++}root.append(el);continue}if(/^\s*>/.test(line)){const quote=document.createElement('blockquote');while(i<lines.length&&/^\s*>/.test(lines[i])){if(quote.childNodes.length)quote.append(document.createElement('br'));appendAgentMarkdownInline(quote,lines[i].replace(/^\s*>\s?/,''));i++}root.append(quote);continue}const paragraph=document.createElement('p'),paragraphStart=i;while(i<lines.length&&lines[i].trim()&&!/^\s*(?:```|#{1,4}\s|>|[-+*]\s+|\d+\.\s+)/.test(lines[i])){if(paragraph.childNodes.length)paragraph.append(document.createElement('br'));appendAgentMarkdownInline(paragraph,lines[i++])}if(i===paragraphStart){appendAgentMarkdownInline(paragraph,lines[i]);i++}root.append(paragraph)}return root
+  for(let i=0;i<lines.length;){const line=lines[i];if(!line.trim()){i++;continue}const fence=line.match(/^\s*```\s*([^ ]*)\s*$/);if(fence){const pre=document.createElement('pre'),code=document.createElement('code');code.dataset.language=fence[1]||'';const body=[];i++;while(i<lines.length&&!/^\s*```/.test(lines[i]))body.push(lines[i++]);if(i<lines.length)i++;code.textContent=body.join('\n');pre.append(code);root.append(pre);continue}const heading=line.match(/^\s*(#{1,4})\s+(.+)$/);if(heading){const el=document.createElement(`h${heading[1].length}`);appendAgentMarkdownInline(el,heading[2]);root.append(el);i++;continue}if(/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)){root.append(document.createElement('hr'));i++;continue}const tableBlock=agentTableBlock(lines,i);if(tableBlock){const {header,alignment}=tableBlock,table=document.createElement('table'),thead=document.createElement('thead'),headRow=document.createElement('tr');header.forEach((cell,index)=>{const th=document.createElement('th');th.style.textAlign=alignment[index].startsWith(':')&&alignment[index].endsWith(':')?'center':alignment[index].endsWith(':')?'right':'left';appendAgentMarkdownInline(th,cell);headRow.append(th)});thead.append(headRow);table.append(thead);const tbody=document.createElement('tbody');i+=2;while(i<lines.length){const cells=agentTableCells(lines[i]);if(!cells)break;const tr=document.createElement('tr');header.forEach((_,index)=>{const td=document.createElement('td');td.style.textAlign=headRow.childNodes[index].style.textAlign;appendAgentMarkdownInline(td,cells[index]||'');tr.append(td)});tbody.append(tr);i++}table.append(tbody);root.append(table);continue}const list=line.match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);if(list){const ordered=!!list[2],el=document.createElement(ordered?'ol':'ul');while(i<lines.length){const item=lines[i].match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);if(!item||!!item[2]!==ordered)break;const li=document.createElement('li');appendAgentMarkdownInline(li,item[3]);el.append(li);i++}root.append(el);continue}if(/^\s*>/.test(line)){const quote=document.createElement('blockquote');while(i<lines.length&&/^\s*>/.test(lines[i])){if(quote.childNodes.length)quote.append(document.createElement('br'));appendAgentMarkdownInline(quote,lines[i].replace(/^\s*>\s?/,''));i++}root.append(quote);continue}const paragraph=document.createElement('p'),paragraphStart=i;while(i<lines.length&&lines[i].trim()&&!/^\s*(?:```|#{1,4}\s|>|[-+*]\s+|\d+\.\s+)/.test(lines[i])&&!agentTableBlock(lines,i)){if(paragraph.childNodes.length)paragraph.append(document.createElement('br'));appendAgentMarkdownInline(paragraph,lines[i++])}if(i===paragraphStart){appendAgentMarkdownInline(paragraph,lines[i]);i++}root.append(paragraph)}return root
+}
+function renderAgentApproval(tab){
+  const root=$('#agent-approval-popover'),approval=tab?.agentApproval;if(!approval){root.classList.add('hidden');return}root.classList.remove('hidden');$('#agent-approval-reason').textContent=approval.reason||'该命令可能造成不可逆变更';$('#agent-approval-command').textContent=approval.command||'';$('#agent-approval-yes').disabled=!!approval.submitting;$('#agent-approval-no').disabled=!!approval.submitting
+}
+function renderAgentPermissionMode(tab){
+  const button=$('#agent-permission-mode'),full=state.sidebarAgentPermissionMode==='full_access';if(full||tab?.agentBusy)state.sidebarAgentPermissionPrompt=false;const confirming=state.sidebarAgentPermissionPrompt;button.textContent=full?'完全访问':'请求批准';button.classList.toggle('full-access',full);button.setAttribute('aria-pressed',String(full));button.setAttribute('aria-expanded',String(confirming));button.disabled=!!tab?.agentBusy;$('#agent-permission-confirm').classList.toggle('hidden',!confirming)
+}
+function answerAgentPermissionMode(enable){
+  if(!state.sidebarAgentPermissionPrompt)return;state.sidebarAgentPermissionPrompt=false;if(enable){state.sidebarAgentPermissionMode='full_access';sessionStorage.setItem('coshell-sidebar-agent-permission-mode',state.sidebarAgentPermissionMode)}renderAgentChat();$('#agent-permission-mode').focus()
+}
+async function answerAgentApproval(approved){
+  const tab=activeTab(),pending=tab?.agentApproval;if(!tab||!pending||pending.submitting)return;pending.submitting=true;renderAgentApproval(tab);try{await api('/api/agent/approval',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,approval_id:pending.approval_id,approved})});if(tab.agentApproval===pending)tab.agentApproval=null;renderAgentChat()}catch(err){if(tab.agentApproval===pending){pending.submitting=false;renderAgentApproval(tab)}toast(err.message,true)}
 }
 function renderAgentChat(){
   const tab=activeTab(),root=$('#agent-chat'),input=$('#agent-chat-input'),send=$('#agent-chat-send');root.replaceChildren();
   $('#agent-session-label').textContent=tab?`${tab.title} · ${tab.status==='connected'?'已连接':'未连接'}`:'未连接终端';
   if(!tab||!tab.agentChat.length){root.innerHTML='<div class="agent-welcome"><span>✦</span><strong>SSH Agent</strong><p>选择一个已连接的终端，然后告诉我需要查询或执行的任务。</p></div>'}
   else for(const entry of tab.agentChat){if(entry.kind==='process'){root.append(renderAgentProcess(entry));continue}const el=document.createElement('div');el.className=`agent-message ${entry.role}${entry.error?' error':''}`;el.append(renderAgentChatMarkdown(entry.text));root.append(el)}
-  const disabled=!tab||tab.status!=='connected'||tab.agentBusy;input.disabled=disabled;send.disabled=disabled;$('#agent-chat-hint').textContent=!tab||tab.status!=='connected'?'请先连接并选择一个 SSH 终端':tab.agentBusy?'Agent 正在执行…':'Enter 发送 · Shift+Enter 换行';root.scrollTop=root.scrollHeight
-}
-function writeAgentOperation(tab,event){
-  if(event.type==='command_start'){tab.term.writeln(`\r\n\x1b[1;38;5;111m[Agent 执行]\x1b[0m\r\n${renderAgentCommand(event.command)}`);return}
-  if(event.type==='command_output'){const value=String(event.data||'').replace(/\r?\n/g,'\r\n');tab.term.write(event.stream==='stderr'?`\x1b[31m${value}\x1b[0m`:value);return}
-  if(event.type==='command_end'){const failed=Number(event.exit_code)!==0;tab.term.writeln(`\r\n\x1b[${failed?'31':'90'}m[Agent ${failed?'执行失败':'执行完成'} · 退出码 ${event.exit_code}]\x1b[0m`)}
+  const disconnected=!tab||tab.status!=='connected',busy=!!tab?.agentBusy;input.disabled=disconnected||busy;send.disabled=disconnected;send.classList.toggle('primary',!busy);send.classList.toggle('stop',busy);send.textContent=busy?'■':'↑';send.setAttribute('aria-label',busy?'停止当前任务':'发送');send.title=busy?'停止当前任务':'发送';renderAgentApproval(tab);renderAgentPermissionMode(tab);root.scrollTop=root.scrollHeight
 }
 function localAgentToolAction(event){if(event.tool==='workspace_list')return '列出本地目录';if(event.tool==='workspace_read')return '读取本地文件';if(event.tool==='workspace_write')return '写入本地文件';if(event.tool==='sftp_transfer')return event.direction==='download'?'下载文件':'上传文件';return '访问本地 workspace'}
 function localAgentToolText(event,phase){const action=localAgentToolAction(event),label=String(event.label||'workspace');if(phase==='start')return `正在${action}：${label}`;if(!event.success)return `${action}失败：${label}${event.error?` · ${event.error}`:''}`;const detail=event.size!==null&&event.size!==undefined?` · ${formatSize(Number(event.size)||0)}`:event.entry_count!==null&&event.entry_count!==undefined?` · ${event.entry_count} 项`:'';return `${action}完成：${label}${detail}`}
 function handleAgentChatEvent(tab,event){
-  if(event.type.startsWith('command_'))writeAgentOperation(tab,event);
   const process=tab.agentProcess;
   if(event.type==='thinking_start'){if(process&&!process.currentThinking){process.currentThinking={type:'thinking',status:'running',text:'正在思考'};process.items.push(process.currentThinking);renderAgentChat()}}
+  else if(event.type==='command_approval_required'){tab.agentApproval={...event,source:'sidebar',submitting:false};renderAgentChat()}
+  else if(event.type==='command_approval_resolved'){if(tab.agentApproval?.approval_id===event.approval_id)tab.agentApproval=null;renderAgentChat()}
+  else if(event.type==='command_denied'){process?.items.push({type:'command',status:'failed',text:`已拒绝执行：${String(event.command||'').replace(/\s+/g,' ').trim()}`});renderAgentChat()}
   else if(event.type==='thinking_end'){if(process?.currentThinking){process.currentThinking.status='done';process.currentThinking.text='思考完成';process.currentThinking=null;renderAgentChat()}}
-  else if(event.type==='command_start'){const command=String(event.command||'').replace(/\s+/g,' ').trim();tab.agentActivity={type:'command',command,status:'running',text:`正在执行命令：${command}`};process?.items.push(tab.agentActivity);if(process)process.currentText=null;renderAgentChat()}
+  else if(event.type==='command_start'){const command=String(event.command||'').replace(/\s+/g,' ').trim();tab.agentActivity={type:'command',command,status:'running',text:`正在执行命令：${command}`,output:''};process?.items.push(tab.agentActivity);if(process)process.currentText=null;renderAgentChat()}
+  else if(event.type==='command_output'&&tab.agentActivity){tab.agentActivity.output=(tab.agentActivity.output+String(event.data||'')).slice(-8000);renderAgentChat()}
   else if(event.type==='command_end'&&tab.agentActivity){const success=Number(event.exit_code)===0;tab.agentActivity.status=success?'done':'failed';tab.agentActivity.text=`${success?'命令执行完成':'命令执行失败'}：${tab.agentActivity.command}`;renderAgentChat()}
   else if(event.type==='local_tool_start'){const item={type:'tool',status:'running',text:localAgentToolText(event,'start')};if(!tab.agentLocalActivities)tab.agentLocalActivities=new Map();tab.agentLocalActivities.set(event.id||`${event.tool}:${event.label}`,item);process?.items.push(item);if(process)process.currentText=null;renderAgentChat()}
   else if(event.type==='local_tool_end'){const key=event.id||`${event.tool}:${event.label}`,item=tab.agentLocalActivities?.get(key);if(item){item.status=event.success?'done':'failed';item.text=localAgentToolText(event,'end');tab.agentLocalActivities.delete(key)}else process?.items.push({type:'tool',status:event.success?'done':'failed',text:localAgentToolText(event,'end')});renderAgentChat()}
@@ -143,16 +248,23 @@ function handleAgentChatEvent(tab,event){
   else if(event.type==='answer_cancel'){if(process)process.currentText=null;renderAgentChat()}
   else if(event.type==='answer'){const text=event.message+(event.limit_reached?'\n\n已达到本轮执行上限，可发送“继续”接着处理。':'');if(process?.currentText){const index=process.items.indexOf(process.currentText);if(index>=0)process.items.splice(index,1);process.currentText=null}completeAgentProcess(tab);agentEntry(tab,{kind:'message',role:'assistant',text})}
   else if(event.type==='error'){completeAgentProcess(tab,'failed');agentEntry(tab,{kind:'message',role:'assistant',error:true,text:event.message})}
+  else if(event.type==='cancelled'){completeAgentProcess(tab,'failed');agentEntry(tab,{kind:'message',role:'assistant',text:event.message||'任务已停止'})}
   else if(event.type==='done'&&process?.status==='running'){completeAgentProcess(tab);renderAgentChat()}
 }
 async function runAgentChat(tab,message){
-  if(!message.trim()||tab.agentBusy)return;tab.agentBusy=true;tab.agentActivity=null;tab.agentLocalActivities=new Map();tab.agentStreamingMessage=null;agentEntry(tab,{kind:'message',role:'user',text:message.trim()});startAgentProcess(tab);renderAgentChat();
-  try{const response=await fetch('/api/agent/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:tab.sessionId,message:message.trim()})});if(!response.ok){let detail=response.statusText;try{detail=(await response.json()).detail||detail}catch{}throw new Error(detail)}if(!response.body)throw new Error('当前环境不支持流式响应');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});const lines=buffer.split('\n');buffer=lines.pop()||'';for(const line of lines)if(line.trim())handleAgentChatEvent(tab,JSON.parse(line));if(done)break}if(buffer.trim())handleAgentChatEvent(tab,JSON.parse(buffer))}
-  catch(err){completeAgentProcess(tab,'failed');agentEntry(tab,{kind:'message',role:'assistant',error:true,text:err.message});toast(err.message,true)}finally{tab.agentBusy=false;tab.agentActivity=null;tab.agentLocalActivities=null;tab.agentStreamingMessage=null;if(tab.agentProcess?.status==='running')completeAgentProcess(tab);renderAgentChat();tab.term.scrollToBottom()}
+  if(!message.trim()||tab.agentBusy)return;tab.agentBusy=true;tab.agentAbortController=new AbortController();tab.agentActivity=null;tab.agentLocalActivities=new Map();tab.agentStreamingMessage=null;const pendingContext=tab.agentPendingContext;tab.agentPendingContext=null;agentEntry(tab,{kind:'message',role:'user',text:message.trim()});startAgentProcess(tab);renderAgentChat();
+  try{const response=await fetch('/api/agent/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},signal:tab.agentAbortController.signal,body:JSON.stringify({session_id:tab.sessionId,message:message.trim(),terminal_context:pendingContext?.text||null,permission_mode:state.sidebarAgentPermissionMode})});if(!response.ok){let detail=response.statusText;try{detail=(await response.json()).detail||detail}catch{}throw new Error(detail)}if(!response.body)throw new Error('当前环境不支持流式响应');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});const lines=buffer.split('\n');buffer=lines.pop()||'';for(const line of lines)if(line.trim())handleAgentChatEvent(tab,JSON.parse(line));if(done)break}if(buffer.trim())handleAgentChatEvent(tab,JSON.parse(buffer))}
+  catch(err){if(err.name==='AbortError'){completeAgentProcess(tab,'failed');agentEntry(tab,{kind:'message',role:'assistant',text:'任务已停止'})}else{completeAgentProcess(tab,'failed');agentEntry(tab,{kind:'message',role:'assistant',error:true,text:err.message});toast(err.message,true)}}finally{tab.agentBusy=false;tab.agentAbortController=null;tab.agentActivity=null;tab.agentLocalActivities=null;tab.agentStreamingMessage=null;if(tab.agentApproval?.source==='sidebar')tab.agentApproval=null;if(tab.agentProcess?.status==='running')completeAgentProcess(tab);renderAgentChat()}
 }
-$('#agent-chat-form').onsubmit=e=>{e.preventDefault();const tab=activeTab(),input=$('#agent-chat-input'),message=input.value;if(!tab?.sessionId)return toast('请先连接并选择一个终端',true);if(!message.trim())return;input.value='';runAgentChat(tab,message)};
+$('#agent-chat-form').onsubmit=e=>{e.preventDefault();const tab=activeTab(),input=$('#agent-chat-input'),message=input.value;if(!tab?.sessionId)return toast('请先连接并选择一个终端',true);if(tab.agentBusy){tab.agentAbortController?.abort();return}if(!message.trim())return;input.value='';runAgentChat(tab,message)};
 $('#agent-chat-input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#agent-chat-form').requestSubmit()}};
-$('#agent-open-settings').onclick=async()=>{await openSettings();const button=$('.settings-tab[data-settings-panel="agent"]');button?.click()};
+$('#agent-approval-yes').onclick=()=>answerAgentApproval(true);
+$('#agent-approval-no').onclick=()=>answerAgentApproval(false);
+$('#agent-permission-confirm-yes').onclick=()=>answerAgentPermissionMode(true);
+$('#agent-permission-confirm-no').onclick=()=>answerAgentPermissionMode(false);
+$('#agent-permission-mode').onclick=()=>{const tab=activeTab();if(tab?.agentBusy)return;const full=state.sidebarAgentPermissionMode==='full_access';if(full){state.sidebarAgentPermissionMode='request_approval';state.sidebarAgentPermissionPrompt=false;sessionStorage.setItem('coshell-sidebar-agent-permission-mode',state.sidebarAgentPermissionMode);renderAgentChat();return}state.sidebarAgentPermissionPrompt=!state.sidebarAgentPermissionPrompt;renderAgentChat();if(state.sidebarAgentPermissionPrompt)$('#agent-permission-confirm-no').focus()};
+$('#agent-new-chat').onclick=async()=>{const tab=activeTab();if(!tab||tab.agentBusy)return;if(tab.sessionId)try{await api('/api/agent/chat/reset',{method:'POST',body:JSON.stringify({session_id:tab.sessionId})})}catch(err){return toast(err.message,true)}tab.agentChat=[];tab.agentPendingContext=null;renderAgentChat();toast('已新建 Agent 对话')};
+$('#agent-attach-terminal').onclick=()=>{const tab=activeTab();if(!tab?.sessionId)return toast('请先连接并选择一个终端',true);tab.agentPendingContext=recentTerminalContext(tab);renderAgentChat();toast(`已附加${tab.agentPendingContext.source==='selection'?'选中内容':'终端内容'} ${tab.agentPendingContext.lineCount} 行到上下文`)};
 $('#agent-chat').addEventListener('contextmenu',event=>{
   const root=$('#agent-chat'),selection=window.getSelection(),insideSelection=selection&&!selection.isCollapsed&&root.contains(selection.anchorNode)&&root.contains(selection.focusNode),selected=insideSelection?selection.toString():'';
   const message=event.target.closest('.agent-message'),messageText=message?.innerText?.trim()||'';
@@ -163,31 +275,35 @@ $('#agent-chat').addEventListener('contextmenu',event=>{
   ])
 });
 function handleAgentTerminalInput(tab,data){
-  if(tab.agentBusy){if(!tab.agentBusyNotice){tab.term.writeln('\r\n\x1b[33mAgent 正在执行，请稍候…\x1b[0m');tab.agentBusyNotice=true}return}
+  if(tab.quickAgentBusy){if(tab.quickAgentApproval)return handleTerminalAgentApprovalInput(tab,data);if(data.includes('\x03')){tab.quickAgentAbort?.abort();return}if(!tab.agentBusyNotice){tab.term.writeln('\r\n\x1b[33m终端 Agent 正在处置，按 Ctrl+C 停止…\x1b[0m');tab.agentBusyNotice=true}return}
   tab.agentBusyNotice=false;
+  if(tab.agentAutocompleteOpen&&handleTerminalAgentAutocompleteKey(tab,data))return;
   if(tab.agentBuffer===null&&data.includes('\x1b')){rawTerminalInput(tab,data);tab.typedLine='?';return}
   for(const char of data){
     if(tab.agentBuffer!==null){
-      if(char==='\x7f'||char==='\b'){if(tab.agentBuffer)tab.agentBuffer=eraseLastLocalCharacter(tab.term,tab.agentBuffer);if(!tab.agentBuffer)tab.agentBuffer=null;continue}
+      if(char==='\x7f'||char==='\b'){hideTerminalAgentAutocomplete(tab);if(tab.agentBuffer)tab.agentBuffer=eraseLastLocalCharacter(tab.term,tab.agentBuffer);if(!tab.agentBuffer)tab.agentBuffer=null;continue}
       if(char==='\r'||char==='\n'){
-        const captured=tab.agentBuffer;tab.agentBuffer=null;tab.typedLine='';
-        if(captured==='/agent'||captured.startsWith('/agent ')){const context=recentTerminalContext(tab,captured);tab.term.write('\r\n');runAgent(tab,captured.slice(6).trim(),context)}else{eraseLocalInput(tab.term,captured);rawTerminalInput(tab,captured+'\r')}continue
+        const captured=tab.agentBuffer;hideTerminalAgentAutocomplete(tab);tab.agentBuffer=null;tab.typedLine='';
+        if(captured==='/agent'||captured.startsWith('/agent ')){const context=recentTerminalContext(tab,captured);tab.term.write('\r\n');runAgent(tab,captured.slice(6).trim(),context)}else{eraseLocalInput(tab.term,captured);tab.lastCommandStart=Math.max(0,tab.term.buffer.active.baseY+tab.term.buffer.active.cursorY-Math.floor(terminalCellWidth(captured)/Math.max(1,tab.term.cols)));tab.lastCommand=captured;rawTerminalInput(tab,captured+'\r')}continue
       }
-      if(char>=' '){tab.agentBuffer+=char;tab.term.write(char);const valid='/agent'.startsWith(tab.agentBuffer)||tab.agentBuffer==='/agent'||tab.agentBuffer.startsWith('/agent ');if(!valid){const buffered=tab.agentBuffer;eraseLocalInput(tab.term,buffered);tab.agentBuffer=null;tab.typedLine=buffered;rawTerminalInput(tab,buffered)}}
-      else{const buffered=tab.agentBuffer;eraseLocalInput(tab.term,buffered);tab.agentBuffer=null;tab.typedLine=buffered;rawTerminalInput(tab,buffered+char)}
+      if(char>=' '){tab.agentBuffer+=char;const showCompletions=tab.agentBuffer==='/agent ';tab.term.write(char,showCompletions?()=>showTerminalAgentAutocomplete(tab):undefined);if(!showCompletions)hideTerminalAgentAutocomplete(tab);const valid='/agent'.startsWith(tab.agentBuffer)||tab.agentBuffer==='/agent'||tab.agentBuffer.startsWith('/agent ');if(!valid){const buffered=tab.agentBuffer;hideTerminalAgentAutocomplete(tab);eraseLocalInput(tab.term,buffered);tab.agentBuffer=null;tab.typedLine=buffered;rawTerminalInput(tab,buffered)}}
+      else{const buffered=tab.agentBuffer;hideTerminalAgentAutocomplete(tab);eraseLocalInput(tab.term,buffered);tab.agentBuffer=null;tab.typedLine=buffered;rawTerminalInput(tab,buffered+char)}
       continue
     }
-    if(char==='/'&&!tab.typedLine){tab.agentBuffer='/';tab.term.write('/');continue}
+    if(char==='/'&&!tab.typedLine&&tab.term.buffer.active.type!=='alternate'){tab.agentBuffer='/';tab.term.write('/');continue}
+    if(char==='\r'||char==='\n'){tab.lastCommandStart=Math.max(0,tab.term.buffer.active.baseY+tab.term.buffer.active.cursorY-Math.floor(terminalCellWidth(tab.typedLine)/Math.max(1,tab.term.cols)));tab.lastCommand=tab.typedLine}
     rawTerminalInput(tab,char);
     if(char==='\r'||char==='\n'||char==='\x03'||char==='\x15')tab.typedLine='';else if(char==='\x7f'||char==='\b')tab.typedLine=[...tab.typedLine].slice(0,-1).join('');else if(char>=' ')tab.typedLine+=char
   }
 }
 function sendTerminalInput(tab,data){if(tab.ws?.readyState===WebSocket.OPEN&&tab.status==='connected'){handleAgentTerminalInput(tab,data);return}if(tab.status==='idle'||tab.status==='error')handleLocalTerminalInput(tab,data)}
-function writeAtTerminalBottom(tab,data){tab.term.write(data,()=>tab.term.scrollToBottom());requestAnimationFrame(()=>tab.term.scrollToBottom())}
-function showReconnectPrompt(tab,message='连接已断开'){if(tab.localPromptShown)return;tab.localPromptShown=true;tab.localInput='';tab.sessionId=null;writeAtTerminalBottom(tab,`\x1b[?1049l\x1b[0m\r\x1b[2K\r\n\x1b[90m[${terminalText(message)}，输入 /reconnect 重新连接]\x1b[0m\r\n\x1b[36mlocal> \x1b[0m`)}
+function terminalAppendRows(term){const buffer=term.buffer.active,cursorRow=buffer.baseY+buffer.cursorY;let contentRow=-1;for(let row=buffer.length-1;row>=0;row--){if(buffer.getLine(row)?.translateToString(true)){contentRow=row;break}}return Math.max(1,contentRow-cursorRow+1)}
+function writeAtTerminalBottom(tab,data){tab.term.write('\x1b[?1049l',()=>{const rows=terminalAppendRows(tab.term);tab.term.write(`\x1b[0m${'\r\n'.repeat(rows)}\x1b[2K\r${data}`,()=>tab.term.scrollToBottom())});requestAnimationFrame(()=>tab.term.scrollToBottom())}
+function showReconnectPrompt(tab,message='连接已断开'){if(tab.localPromptShown)return;tab.localPromptShown=true;tab.localInput='';tab.sessionId=null;writeAtTerminalBottom(tab,`\x1b[90m[${terminalText(message)}，输入 /reconnect 重新连接]\x1b[0m\r\n\x1b[36mlocal> \x1b[0m`)}
 function handleLocalTerminalInput(tab,data){if(data.includes('\x1b'))return;data=data.replace(/\r\n/g,'\r');for(const char of data){if(char==='\r'||char==='\n'){const command=(tab.localInput||'').trim();tab.term.write('\r\n');tab.localInput='';if(command==='/reconnect'){reconnectTab(tab);return}if(command)tab.term.writeln('\x1b[33m离线状态仅支持 /reconnect\x1b[0m');tab.term.write('\x1b[36mlocal> \x1b[0m')}else if(char==='\x7f'||char==='\b'){if(tab.localInput){tab.localInput=[...tab.localInput].slice(0,-1).join('');tab.term.write('\b \b')}}else if(char>=' '){tab.localInput=(tab.localInput||'')+char;tab.term.write(char)}}}
 function reconnectTab(tab){if(tab.status==='connecting'||tab.status==='connected')return;if(tab.server_id){if(!state.vault?.vault_unlocked){state.pendingReconnect=tab;openVault();return}connectTab(tab,{server_id:tab.server_id})}else openConnect({name:tab.title},tab)}
-function fitTerminal(tab,focus=false){if(!tab||tab.id!==state.activeId||!tab.host.classList.contains('active'))return;const rect=tab.host.getBoundingClientRect();if(rect.width<20||rect.height<20)return;try{tab.fit.fit();tab.term.refresh(0,Math.max(0,tab.term.rows-1));if(focus)tab.term.focus()}catch{}}
+function syncTerminalSize(tab,cols=tab?.term.cols,rows=tab?.term.rows){if(tab?.ws?.readyState===WebSocket.OPEN&&tab.status==='connected')tab.ws.send(JSON.stringify({type:'resize',cols,rows}))}
+function fitTerminal(tab,focus=false){if(!tab||tab.id!==state.activeId||!tab.host.classList.contains('active'))return;const rect=tab.host.getBoundingClientRect();if(rect.width<20||rect.height<20)return;try{tab.fit.fit();syncTerminalSize(tab);tab.term.refresh(0,Math.max(0,tab.term.rows-1));if(focus)tab.term.focus()}catch{}}
 function scheduleTerminalFit(tab,focus=false){requestAnimationFrame(()=>{fitTerminal(tab,focus);setTimeout(()=>fitTerminal(tab,focus),60);setTimeout(()=>fitTerminal(tab,false),250)})}
 
 const terminalThemes={
@@ -264,21 +380,24 @@ function newTerminal(tabData={}){
   const host=document.createElement('div'); host.className='terminal-host'; host.dataset.id=id; $('#terminals').append(host);
   const term=new Terminal({cursorBlink:true,fontSize:14,fontFamily:'Cascadia Mono, Sarasa Mono SC, Noto Sans Mono CJK SC, Microsoft YaHei UI, Consolas, monospace',letterSpacing:0,lineHeight:1.08,scrollback:6000,theme:terminalThemes[currentTheme()],allowProposedApi:true});
   const fit=new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
-  const tab={id,title:tabData.title||'新终端',server_id:tabData.server_id??null,last_path:tabData.last_path||'.',position:state.tabs.length,status:'idle',term,fit,host,ws:null,sessionId:null,localInput:'',localPromptShown:false,typedLine:'',agentBuffer:null,agentBusy:false,agentBusyNotice:false,agentChat:[],agentActivity:null,agentStreamingMessage:null,agentProcess:null,agentProcessTimer:null};
-  term.writeln('\x1b[38;5;111mSSH Terminal\x1b[0m — 点击连接开始会话\r\n');
+  const tab={id,title:tabData.title||'新终端',server_id:tabData.server_id??null,last_path:tabData.last_path||'.',position:state.tabs.length,status:'idle',term,fit,host,ws:null,sessionId:null,localInput:'',localPromptShown:false,typedLine:'',lastCommand:'',lastCommandStart:null,agentBuffer:null,agentAutocomplete:null,agentAutocompleteOpen:false,agentAutocompleteIndex:0,agentBusy:false,agentBusyNotice:false,agentAbortController:null,agentPendingContext:null,agentApproval:null,agentChat:[],agentActivity:null,agentStreamingMessage:null,agentProcess:null,agentProcessTimer:null,quickAgentBusy:false,quickAgentAbort:null,quickAgentApproval:null,quickApprovalBuffer:'',quickAgentPermissionMode:'request_approval',quickIncidentCommandStart:null};
+  createTerminalAgentAutocomplete(tab);
+  term.writeln('\x1b[38;5;111mCoShell\x1b[0m — 点击连接开始会话\r\n');
   // xterm.js owns key-to-sequence conversion so application cursor/keypad modes
   // selected by ncurses programs are preserved and each key is emitted once.
   term.onData(data=>sendTerminalInput(tab,data));
-  term.onResize(({cols,rows})=>{if(tab.ws?.readyState===WebSocket.OPEN&&tab.status==='connected')tab.ws.send(JSON.stringify({type:'resize',cols,rows}))});
+  term.onResize(({cols,rows})=>{syncTerminalSize(tab,cols,rows);if(tab.agentAutocompleteOpen)positionTerminalAgentAutocomplete(tab)});
+  host.addEventListener('pointerdown',event=>{if(tab.agentAutocompleteOpen&&!tab.agentAutocomplete.contains(event.target))hideTerminalAgentAutocomplete(tab)});
   host.addEventListener('contextmenu',event=>showTerminalMenu(event,tab));
   state.tabs.push(tab); renderTabs(); activateTab(id); saveTabs(); return tab;
 }
 function activateTab(id){
-  if(id)hideQuickConnect();
+  if(id)hideHostManager();
+  state.tabs.forEach(tab=>{if(tab.id!==id)hideTerminalAgentAutocomplete(tab)});
   state.activeId=id; $$('.terminal-host').forEach(x=>x.classList.toggle('active',x.dataset.id===id));
   $$('.terminal-tab').forEach(x=>x.classList.toggle('active',x.dataset.id===id));
   $('#welcome').classList.toggle('hidden',!!id); const tab=activeTab();
-  if(tab){scheduleTerminalFit(tab,true); $('#sftp-path').value=tab.last_path||'.'; loadSftp();}
+  if(tab){scheduleTerminalFit(tab,true);if(tab.agentBuffer==='/agent ')requestAnimationFrame(()=>showTerminalAgentAutocomplete(tab));$('#sftp-path').value=tab.last_path||'.'; loadSftp();}
   renderAgentChat();
   loadSystemInfo();
 }
@@ -292,7 +411,7 @@ function renderTabs(){
 }
 async function closeTab(tab){
   if(tab.status==='connected'&&!await themedConfirm(`关闭 ${tab.title} 并断开 SSH？`))return;
-  if(tab.agentProcessTimer)clearInterval(tab.agentProcessTimer);
+  if(tab.agentProcessTimer)clearInterval(tab.agentProcessTimer);tab.agentAbortController?.abort();tab.quickAgentAbort?.abort();
   if(tab.ws?.readyState===WebSocket.OPEN){tab.ws.send(JSON.stringify({type:'close'}));tab.ws.close()}
   tab.term.dispose();tab.host.remove();const i=state.tabs.indexOf(tab);state.tabs.splice(i,1);if(state.activeId===tab.id)state.activeId=state.tabs[Math.max(0,i-1)]?.id||null;renderTabs();activateTab(state.activeId);saveTabs();
 }
@@ -300,37 +419,39 @@ function updateCount(){const n=state.tabs.filter(t=>t.status==='connected').leng
 let saveTimer;function saveTabs(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>api('/api/tabs',{method:'PUT',body:JSON.stringify(state.tabs.map((t,i)=>({id:t.id,title:t.title,server_id:t.server_id,position:i,last_path:t.last_path||'.'})))}).catch(()=>{}),250)}
 
 function openConnect(prefill={},reuseTab=null){
-  const f=$('#connect-form');f.reset();f.dataset.reuseTabId=reuseTab?.id||'';f.elements.port.value=prefill.port||22;Object.entries(prefill).forEach(([k,v])=>{if(f.elements[k]&&v!=null)f.elements[k].value=v});
+  const f=$('#connect-form'),saveOnly=!!prefill.saveOnly;f.reset();f.dataset.reuseTabId=reuseTab?.id||'';f.dataset.saveOnly=String(saveOnly);f.elements.port.value=prefill.port||22;Object.entries(prefill).forEach(([k,v])=>{if(f.elements[k]&&v!=null)f.elements[k].value=v});
   updateSSHKeyOptions();
-  f.elements.save.checked=!!prefill.forceSave; authFields(); $('#connect-dialog').showModal();
+  f.elements.save.checked=!!prefill.forceSave||saveOnly;$('#connect-save-field').classList.toggle('hidden',saveOnly);$('#connect-dialog-title').textContent=saveOnly?'新建主机':'新建 SSH 连接';$('#connect-submit').textContent=saveOnly?'保存主机':'连接';authFields(); $('#connect-dialog').showModal();
 }
 function authFields(){const f=$('#connect-form'),key=f.elements.auth_type.value==='private_key',saved=!!f.elements.ssh_key_id.value;$$('.key-field').forEach(x=>x.classList.toggle('hidden',!key));$$('.manual-key-field').forEach(x=>x.classList.toggle('hidden',!key||saved));$('.password-field').classList.toggle('hidden',key)}
 $('#connect-form').elements.auth_type.addEventListener('change',authFields);
 $('#connect-form').elements.ssh_key_id.addEventListener('change',authFields);
 $('#connect-form').addEventListener('submit',async e=>{e.preventDefault();const f=e.target,d=Object.fromEntries(new FormData(f));let serverId=d.server_id?Number(d.server_id):null;
   const payload={name:d.name||d.host,host:d.host,port:Number(d.port),username:d.username,auth_type:d.auth_type,password:d.password||null,private_key:d.private_key||null,passphrase:d.passphrase||null,ssh_key_id:d.ssh_key_id?Number(d.ssh_key_id):null,note:''};
-  try{if(d.save){const saved=await api('/api/servers',{method:'POST',body:JSON.stringify(payload)});serverId=saved.id;await loadServers()}
+  try{if(d.save||f.dataset.saveOnly==='true'){const saved=await api('/api/servers',{method:'POST',body:JSON.stringify(payload)});serverId=saved.id;await loadServers()}
+    if(f.dataset.saveOnly==='true'){$('#connect-dialog').close();toast('主机已保存');return}
     const reused=state.tabs.find(t=>t.id===f.dataset.reuseTabId),tab=reused||newTerminal({title:payload.name,server_id:serverId});tab.title=payload.name;tab.server_id=serverId;renderTabs();saveTabs();$('#connect-dialog').close();connectTab(tab,serverId?{server_id:serverId}:payload);
   }catch(err){if(err.message.includes('锁定'))openVault();toast(err.message,true)}});
 function connectTab(tab,connection){
-  const reconnecting=tab.localPromptShown;if(tab.ws?.readyState===WebSocket.OPEN)tab.ws.close();tab.status='connecting';tab.localInput='';tab.typedLine='';tab.agentBuffer=null;tab.localPromptShown=false;renderTabs();writeAtTerminalBottom(tab,`\r\x1b[2K\x1b[33m${reconnecting?'正在重新连接':'正在连接'}…\x1b[0m\r\n`);
+  fitTerminal(tab);
+  const reconnecting=tab.localPromptShown;if(tab.ws?.readyState===WebSocket.OPEN)tab.ws.close();tab.status='connecting';tab.localInput='';tab.typedLine='';tab.lastCommand='';tab.lastCommandStart=null;tab.agentBuffer=null;tab.localPromptShown=false;renderTabs();writeAtTerminalBottom(tab,`\x1b[33m${reconnecting?'正在重新连接':'正在连接'}…\x1b[0m\r\n`);
   const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws/terminal`);tab.ws=ws;
   ws.onopen=()=>{let payload={type:'connect',cols:tab.term.cols,rows:tab.term.rows,...connection};ws.send(JSON.stringify(payload))};
-  ws.onmessage=e=>{if(tab.ws!==ws)return;const m=JSON.parse(e.data);if(m.type==='connected'){tab.status='connected';tab.sessionId=m.session_id;tab.term.writeln('\x1b[32m已连接\x1b[0m');renderTabs();renderAgentChat();scheduleTerminalFit(tab,true);loadSftp();loadSystemInfo();loadServers()}
+  ws.onmessage=e=>{if(tab.ws!==ws)return;const m=JSON.parse(e.data);if(m.type==='connected'){tab.status='connected';tab.sessionId=m.session_id;fitTerminal(tab);tab.term.writeln('\x1b[32m已连接\x1b[0m');renderTabs();renderAgentChat();scheduleTerminalFit(tab,true);loadSftp();loadSystemInfo();loadServers()}
     else if(m.type==='output'&&!tab.localPromptShown&&(tab.status==='connecting'||tab.status==='connected')){const bytes=Uint8Array.from(atob(m.data),c=>c.charCodeAt(0));tab.term.write(bytes)}
     else if(m.type==='host_key')showHostKeyDialog(ws,m)
     else if(m.type==='error'){tab.status='error';renderTabs();renderAgentChat();showReconnectPrompt(tab,m.message);toast(m.message,true)}else if(m.type==='disconnected'){tab.status='idle';renderTabs();renderAgentChat();showReconnectPrompt(tab);loadSystemInfo()}};
   ws.onerror=()=>{if(tab.ws!==ws)return;tab.status='error';renderTabs();showReconnectPrompt(tab,'连接失败')};ws.onclose=()=>{if(pendingHostKey?.ws===ws){pendingHostKey=null;if($('#host-key-dialog').open)$('#host-key-dialog').close()}if(tab.ws!==ws)return;if(tab.status==='connected'||tab.status==='connecting'){tab.status='idle';renderTabs();showReconnectPrompt(tab);loadSftp();loadSystemInfo()}};
 }
 function markTabDisconnected(tab){if(!tab||tab.status==='idle'&&!tab.sessionId)return;tab.status='idle';tab.sessionId=null;if(tab.ws?.readyState===WebSocket.OPEN)tab.ws.close();renderTabs();showReconnectPrompt(tab);loadSftp();loadSystemInfo()}
-function showQuickConnect(){
-  renderQuickConnections();
-  $('#quick-connect').classList.remove('hidden');
-  $('#quick-connect-new').focus();
+function showHostManager(){
+  renderHostManager();
+  $('#host-manager').classList.remove('hidden');
+  $('#host-manager-search').focus();
 }
-function hideQuickConnect(){ $('#quick-connect').classList.add('hidden'); }
+function hideHostManager(){ $('#host-manager').classList.add('hidden');closeContextMenu() }
 function connectSavedServer(server){
-  hideQuickConnect();
+  hideHostManager();
   const tab=newTerminal({title:server.name,server_id:server.id});
   if(!state.vault?.vault_unlocked){state.pendingReconnect=tab;openVault();return}
   connectTab(tab,{server_id:server.id});
@@ -345,20 +466,43 @@ function recentConnectionLabel(value){
   if(seconds<604800)return `${Math.floor(seconds/86400)} 天前`;
   return time.toLocaleDateString('zh-CN',{month:'short',day:'numeric'});
 }
-function renderQuickConnections(){
-  const root=$('#quick-connect-list');root.replaceChildren();
-  for(const server of state.servers){
-    const row=document.createElement('button');row.className='quick-connect-row';row.type='button';
-    row.innerHTML=`<span class="quick-connect-icon">›_</span><span class="quick-connect-main"><strong>${esc(server.name)}</strong><small>${recentConnectionLabel(server.last_connected_at)}</small></span><span class="quick-connect-address">${esc(server.username)}@${esc(server.host)}${server.port===22?'':`:${server.port}`}</span><span class="quick-connect-arrow">→</span>`;
-    row.setAttribute('aria-label',`连接到 ${server.name}`);row.onclick=()=>connectSavedServer(server);root.append(row)
+const hostSystemIcons={
+  default:{label:'未知系统'},linux:{label:'Linux'},ubuntu:{label:'Ubuntu'},debian:{label:'Debian'},
+  fedora:{label:'Fedora'},centos:{label:'CentOS'},rhel:{label:'Red Hat'},rocky:{label:'Rocky Linux'},
+  alma:{label:'AlmaLinux'},alpine:{label:'Alpine Linux'},arch:{label:'Arch Linux'},opensuse:{label:'openSUSE'},
+  kali:{label:'Kali Linux'},mint:{label:'Linux Mint'},amazon:{label:'Amazon Linux'},oracle:{label:'Oracle Linux'},
+  freebsd:{label:'FreeBSD'},macos:{label:'macOS'},windows:{label:'Windows'},gentoo:{label:'Gentoo'},void:{label:'Void Linux'}
+};
+function hostIconMarkup(server){const type=hostSystemIcons[server.os_type]?server.os_type:'default',icon=hostSystemIcons[type];return `<span class="host-icon host-icon-${type}" title="${icon.label}" aria-hidden="true">${type==='default'?'<span class="host-icon-server"><i></i><i></i></span>':`<img src="/static/icons/os/${type}.svg" alt="">`}</span>`}
+function showHostMenu(event,server){showContextMenu(event,[
+  {label:'连接',run:()=>connectSavedServer(server)},
+  {label:'编辑',run:()=>editServer(server)},
+  {label:'打开workspace',run:()=>openServerWorkspace(server)},
+  null,
+  {label:'删除',run:()=>deleteServer(server)}
+])}
+function renderHostManager(){
+  const query=$('#host-manager-search').value.trim().toLowerCase(),root=$('#host-manager-list');root.replaceChildren();
+  const servers=state.servers.filter(server=>`${server.name} ${server.host} ${server.username} ${server.note||''}`.toLowerCase().includes(query));
+  $('#host-manager-count').textContent=query?`${servers.length} 个结果`:`${state.servers.length} 台主机`;
+  for(const server of servers){
+    const card=document.createElement('article');card.className='host-card';card.tabIndex=0;card.setAttribute('aria-label',`${server.name}，双击连接`);
+    card.innerHTML=`${hostIconMarkup(server)}<span class="host-card-copy"><strong>${esc(server.name)}</strong><span>${esc(server.username)}@${esc(server.host)}${server.port===22?'':`:${server.port}`}</span><small>${esc(recentConnectionLabel(server.last_connected_at))}</small></span><button class="host-card-more" type="button" aria-label="${esc(server.name)} 的更多操作">•••</button>`;
+    card.onclick=()=>{$$('.host-card',root).forEach(item=>item.classList.toggle('selected',item===card))};
+    card.ondblclick=()=>connectSavedServer(server);card.oncontextmenu=event=>showHostMenu(event,server);
+    card.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();connectSavedServer(server)}};
+    $('.host-card-more',card).onclick=event=>{event.stopPropagation();showHostMenu(event,server)};root.append(card)
   }
-  if(!root.children.length)root.innerHTML='<div class="quick-connect-empty"><strong>还没有保存的服务器</strong><span>通过上方“新建连接”保存第一个常用连接。</span></div>';
+  if(!root.children.length){
+    root.innerHTML=query?'<div class="host-manager-empty"><span class="host-manager-empty-search" aria-hidden="true"></span><strong>没有匹配的主机</strong></div>':'<div class="host-manager-empty"><span class="host-manager-empty-icon" aria-hidden="true"></span><strong>点击右上角新建主机</strong></div>';
+  }
 }
-$('#new-tab').onclick=showQuickConnect;
-$('#quick-connect-close').onclick=hideQuickConnect;
-$('#quick-connect-new').onclick=()=>{hideQuickConnect();openConnect()};
-$('#quick-connect').addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();hideQuickConnect();$('#new-tab').focus()}});
-$('#welcome-connect').onclick=()=>openConnect();
+$('#host-library-button').onclick=showHostManager;
+$('#host-manager-close').onclick=hideHostManager;
+$('#host-manager-new').onclick=()=>openConnect({forceSave:true,saveOnly:true});
+$('#host-manager-search').oninput=renderHostManager;
+$('#host-manager').addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();hideHostManager();$('#host-library-button').focus()}});
+$('#welcome-connect').onclick=showHostManager;
 
 function formatBytes(value){if(!value)return '0M';const units=['B','K','M','G','T'];let n=value,i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return `${n>=10||i<2?Math.round(n):n.toFixed(1)}${units[i]}`}
 function formatUptime(seconds){seconds=Math.max(0,Number(seconds)||0);const days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600),minutes=Math.floor(seconds%3600/60);return [days&&`${days}天`,hours&&`${hours}小时`,(!days&&minutes||(!days&&!hours))&&`${minutes}分钟`].filter(Boolean).join(' ')}
@@ -370,10 +514,10 @@ $('#copy-system-ip').onclick=async()=>{const ip=$('#system-ip').textContent;if(i
 $('#system-info-toggle').onclick=()=>{const collapsed=$('#system-info').classList.toggle('collapsed');$('#system-info-toggle').setAttribute('aria-expanded',String(!collapsed))};
 setInterval(()=>{if(!document.hidden)loadSystemInfo()},5000);
 
-async function loadServers(){state.servers=await api('/api/servers');renderServers();renderQuickConnections()}
-function renderServers(){const q=$('#server-search').value.toLowerCase(),root=$('#server-list');root.replaceChildren();state.servers.filter(s=>`${s.name} ${s.host} ${s.username}`.toLowerCase().includes(q)).forEach(s=>{const card=document.createElement('div');card.className='card';card.innerHTML=`<div class="card-title"><span class="status-dot"></span>${esc(s.name)}</div><div class="card-sub">${esc(s.username)}@${esc(s.host)}:${s.port}</div><div class="card-actions"><button class="connect">连接</button><button class="edit">编辑</button><button class="delete danger">删除</button></div>`;$('.connect',card).onclick=()=>connectSavedServer(s);$('.edit',card).onclick=()=>editServer(s);$('.delete',card).onclick=async()=>{if(!await themedConfirm(`删除服务器“${s.name}”？`))return;const deleteWorkspace=await themedConfirm(`是否同时删除“${s.name}”对应 workspace 中的所有文件？\n\n选择“取消”将保留这些文件。`);await api(`/api/servers/${s.id}?delete_workspace=${deleteWorkspace}`,{method:'DELETE'});await loadServers();toast(deleteWorkspace?'服务器和 workspace 已删除':'服务器已删除，workspace 已保留')};root.append(card)});if(!root.children.length)root.innerHTML='<div class="empty">暂无保存的服务器</div>'}
-$('#server-search').oninput=renderServers;$('#server-add').onclick=()=>openConnect({forceSave:true});
-function editServer(s){openEditor('编辑服务器',[
+async function loadServers(){state.servers=await api('/api/servers');renderHostManager()}
+async function openServerWorkspace(server){try{await api(`/api/servers/${server.id}/workspace/open`,{method:'POST'});toast('已在资源管理器中打开 workspace')}catch(err){toast(err.message||'打开 workspace 失败',true)}}
+async function deleteServer(server){if(!await themedConfirm(`删除主机“${server.name}”？`,{title:'删除主机',confirmText:'删除',danger:true}))return;const deleteWorkspace=await themedConfirm(`是否同时删除“${server.name}”对应 workspace 中的所有文件？\n\n选择“取消”将保留这些文件。`);await api(`/api/servers/${server.id}?delete_workspace=${deleteWorkspace}`,{method:'DELETE'});await loadServers();toast(deleteWorkspace?'主机和 workspace 已删除':'主机已删除，workspace 已保留')}
+function editServer(s){openEditor('编辑主机',[
   ['name','名称',s.name],['host','主机',s.host],['port','端口',s.port,'number'],['username','用户名',s.username],['auth_type','认证方式',s.auth_type,'select'],['ssh_key_id','密码库密钥',s.ssh_key_id||'','sshkey'],['password','新密码（留空保持不变）','', 'password'],['private_key','新私钥（留空保持不变）','','textarea'],['passphrase','新私钥口令（留空保持不变）','','password'],['note','备注',s.note,'textarea']
 ],async d=>{await api(`/api/servers/${s.id}`,{method:'PUT',body:JSON.stringify({...d,port:Number(d.port),ssh_key_id:d.ssh_key_id?Number(d.ssh_key_id):null,password:d.password||null,private_key:d.private_key||null,passphrase:d.passphrase||null})});loadServers()})}
 

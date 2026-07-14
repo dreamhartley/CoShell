@@ -4,7 +4,7 @@ import argparse
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="轻量 SSH 终端")
+    parser = argparse.ArgumentParser(description="CoShell")
     parser.add_argument(
         "--web",
         action="store_true",

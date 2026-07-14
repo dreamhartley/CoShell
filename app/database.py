@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS servers (
     private_key_enc BLOB,
     passphrase_enc BLOB,
     note TEXT NOT NULL DEFAULT '',
+    os_type TEXT NOT NULL DEFAULT 'default',
     last_connected_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -106,6 +107,8 @@ class Database:
             self._conn.execute("ALTER TABLE servers ADD COLUMN ssh_key_id INTEGER")
         if "last_connected_at" not in columns:
             self._conn.execute("ALTER TABLE servers ADD COLUMN last_connected_at TEXT")
+        if "os_type" not in columns:
+            self._conn.execute("ALTER TABLE servers ADD COLUMN os_type TEXT NOT NULL DEFAULT 'default'")
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(agent_settings)")}
         if "builtin_web_search" not in columns:
             self._conn.execute("ALTER TABLE agent_settings ADD COLUMN builtin_web_search INTEGER NOT NULL DEFAULT 1")

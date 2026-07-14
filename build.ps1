@@ -12,7 +12,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     --noconfirm `
     --clean `
     --windowed `
-    --name "LightSSHTerminal" `
+    --name "CoShell" `
     --icon "assets\app-icon.ico" `
     --add-data "static;static" `
     --add-data "assets\app-icon.ico;assets" `
@@ -29,4 +29,4 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     run.py
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "Build completed: $PSScriptRoot\dist\LightSSHTerminal\LightSSHTerminal.exe"
+Write-Host "Build completed: $PSScriptRoot\dist\CoShell\CoShell.exe"

@@ -45,7 +45,7 @@ def _write_settings(path: Path, port: int) -> None:
                 "      - duckduckgo",
                 "general:",
                 "  debug: false",
-                '  instance_name: "Light SSH Terminal Search"',
+                '  instance_name: "CoShell Search"',
                 "search:",
                 "  safe_search: 1",
                 "  autocomplete: \"\"",

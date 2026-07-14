@@ -29,7 +29,7 @@ def _device_entropy() -> bytes:
             machine_guid = str(winreg.QueryValueEx(key, "MachineGuid")[0])
     except OSError as exc:
         raise DeviceSecretError("无法读取 Windows 设备标识") from exc
-    return hashlib.sha256(("LightSSHTerminal\0" + machine_guid).encode()).digest()
+    return hashlib.sha256(("CoShell\0" + machine_guid).encode()).digest()
 
 
 def _crypt(value: bytes, protect: bool) -> bytes:
@@ -45,7 +45,7 @@ def _crypt(value: bytes, protect: bool) -> bytes:
 
     if protect:
         ok = crypt32.CryptProtectData(
-            ctypes.byref(source), "LightSSHTerminal", ctypes.byref(entropy),
+            ctypes.byref(source), "CoShell", ctypes.byref(entropy),
             None, None, flags, ctypes.byref(result),
         )
     else:

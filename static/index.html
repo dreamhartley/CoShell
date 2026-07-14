@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <script>(()=>{const themes=['dark','light','fresh','ocean','midnight'],saved=localStorage.getItem('webssh-theme'),theme=themes.includes(saved)?saved:(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.dataset.theme=theme;document.documentElement.dataset.themeMode=['dark','midnight'].includes(theme)?'dark':'light'})()</script>
-  <title>SSH Terminal</title>
+  <title>CoShell</title>
   <link rel="stylesheet" href="/static/vendor/xterm.css">
   <link rel="stylesheet" href="/static/vendor/codemirror.css">
   <link rel="stylesheet" href="/static/vendor/codemirror-material-darker.css">
@@ -13,7 +13,7 @@
 <body>
   <header class="topbar">
     <button id="sidebar-toggle" class="icon-btn" title="切换侧栏">☰</button>
-    <div class="brand"><span class="brand-mark">›_</span><strong>SSH Terminal</strong></div>
+    <div class="brand"><span class="brand-mark">›_</span><strong>CoShell</strong></div>
     <div class="top-actions">
       <span id="connection-count" class="muted">0 个连接</span>
       <button id="settings-btn" class="soft-btn">⚙ 设置</button>
@@ -33,28 +33,50 @@
         </div>
       </section>
       <nav class="side-tabs" aria-label="工具">
-        <button class="side-tab" data-panel="agent">Agent</button>
-        <button class="side-tab active" data-panel="sftp">文件</button>
+        <button class="side-tab side-tab-agent active" data-panel="agent" aria-label="Agent" title="Agent"><span class="side-tab-agent-icon" aria-hidden="true"></span></button>
+        <button class="side-tab" data-panel="sftp">文件</button>
         <button class="side-tab" data-panel="shortcuts">指令</button>
-        <button class="side-tab" data-panel="servers">主机</button>
       </nav>
-      <section id="panel-agent" class="side-panel agent-panel">
+      <section id="panel-agent" class="side-panel agent-panel active">
         <div class="agent-panel-head">
-          <div><strong>Agent</strong><span id="agent-session-label">未连接终端</span></div>
-          <button id="agent-open-settings" class="icon-btn" type="button" title="Agent 设置">⚙</button>
+          <div class="agent-panel-title"><strong>Agent</strong><span id="agent-session-label">未连接终端</span></div>
+          <div class="agent-panel-actions">
+            <button id="agent-new-chat" class="icon-btn" type="button" title="新建对话">＋</button>
+          </div>
         </div>
         <div id="agent-chat" class="agent-chat" aria-live="polite">
-          <div class="agent-welcome"><span>✦</span><strong>SSH Agent</strong><p>选择一个已连接的终端，然后告诉我需要查询或执行的任务。</p></div>
+          <div class="agent-welcome"><span>✦</span><strong>CoShell Agent</strong><p>选择一个已连接的终端，然后告诉我需要查询或执行的任务。</p></div>
+        </div>
+        <div id="agent-approval-popover" class="agent-approval-popover hidden" role="alertdialog" aria-labelledby="agent-approval-title" aria-describedby="agent-approval-reason">
+          <div class="agent-approval-copy">
+            <strong id="agent-approval-title">请求执行权限</strong>
+            <span id="agent-approval-reason">该命令可能造成不可逆变更</span>
+          </div>
+          <code id="agent-approval-command"></code>
+          <div class="agent-approval-actions">
+            <button id="agent-approval-no" type="button">否</button>
+            <button id="agent-approval-yes" class="primary" type="button">是</button>
+          </div>
+        </div>
+        <div id="agent-permission-confirm" class="agent-approval-popover agent-permission-confirm hidden" role="alertdialog" aria-labelledby="agent-permission-confirm-title">
+          <div class="agent-approval-copy">
+            <strong id="agent-permission-confirm-title">启用Agent完全访问模式</strong>
+          </div>
+          <div class="agent-approval-actions">
+            <button id="agent-permission-confirm-no" type="button">否</button>
+            <button id="agent-permission-confirm-yes" class="primary" type="button">是</button>
+          </div>
         </div>
         <form id="agent-chat-form" class="agent-composer">
           <div class="agent-input-shell">
-            <textarea id="agent-chat-input" rows="4" maxlength="20000" placeholder="让 Agent 检查服务、部署项目…" aria-label="发送给 Agent 的消息"></textarea>
-            <span id="agent-chat-hint">Enter 发送 · Shift+Enter 换行</span>
+            <textarea id="agent-chat-input" rows="4" maxlength="20000" placeholder="让 Agent 检查服务、部署项目，或附加终端现场…" aria-label="发送给 Agent 的消息"></textarea>
+            <button id="agent-permission-mode" class="agent-permission-mode" type="button" aria-label="Agent 权限模式" aria-haspopup="dialog" aria-controls="agent-permission-confirm" aria-expanded="false" title="切换 Agent 权限模式">请求批准</button>
+            <button id="agent-attach-terminal" class="agent-attach-terminal" type="button" aria-label="附加终端内容到上下文" title="附加终端内容到上下文">&gt;_</button>
             <button id="agent-chat-send" class="agent-send primary" type="submit" aria-label="发送" title="发送">↑</button>
           </div>
         </form>
       </section>
-      <section id="panel-sftp" class="side-panel active">
+      <section id="panel-sftp" class="side-panel">
         <div class="panel-head"><strong>SFTP</strong><button id="sftp-refresh" class="icon-btn" title="刷新">↻</button></div>
         <div class="path-row"><button id="sftp-up" class="icon-btn">↑</button><input id="sftp-path" value="." aria-label="远程路径"><button id="sftp-go" class="soft-btn">前往</button></div>
         <div class="file-actions"><button id="upload-btn">上传</button><button id="new-file-btn">新建文件</button><button id="mkdir-btn">新建目录</button><button id="batch-btn" class="hidden">批量操作</button><input id="upload-input" type="file" multiple hidden></div>
@@ -65,29 +87,28 @@
         <input id="shortcut-search" class="search" placeholder="搜索指令">
         <div id="shortcut-list" class="card-list"></div>
       </section>
-      <section id="panel-servers" class="side-panel">
-        <div class="panel-head"><strong>保存的服务器</strong><button id="server-add" class="icon-btn">＋</button></div>
-        <input id="server-search" class="search" placeholder="搜索服务器">
-        <div id="server-list" class="card-list"></div>
-      </section>
     </aside>
     <div id="resizer" class="resizer"></div>
     <section class="terminal-area">
       <div class="terminal-tabs-bar">
+        <button id="host-library-button" class="host-library-button" type="button" title="打开主机库" aria-label="打开主机库">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9.5Z"/></svg>
+        </button>
         <div id="terminal-tabs" class="terminal-tabs"></div>
-        <button id="new-tab" class="new-tab" title="新建连接">＋</button>
       </div>
       <div id="terminals" class="terminals">
-        <div id="welcome" class="welcome"><div class="welcome-icon">›_</div><h1>轻量 SSH 终端</h1><p>新建连接，或从左侧选择保存的服务器</p><button id="welcome-connect" class="primary">新建连接</button></div>
-        <section id="quick-connect" class="quick-connect hidden" aria-labelledby="quick-connect-title">
-          <div class="quick-connect-card">
-            <div class="quick-connect-head">
-              <div><span class="quick-connect-kicker">SSH 工作区</span><h2 id="quick-connect-title">快速连接</h2></div>
-              <button id="quick-connect-close" class="quick-connect-close" type="button" aria-label="关闭快速连接">返回终端</button>
+        <div id="welcome" class="welcome"><div class="welcome-icon">›_</div><h1>CoShell</h1><p>从主机库选择一台服务器，和 Agent 一起开始工作</p><button id="welcome-connect" class="primary">打开主机库</button></div>
+        <section id="host-manager" class="host-manager hidden" aria-labelledby="host-manager-title">
+          <div class="host-manager-shell">
+            <header class="host-manager-head">
+              <div><span class="host-manager-kicker">SSH 工作区</span><h2 id="host-manager-title">主机</h2><p>双击主机即可在新标签页中连接</p></div>
+              <div class="host-manager-actions"><button id="host-manager-close" class="host-manager-close" type="button">返回终端</button><button id="host-manager-new" class="primary" type="button"><span aria-hidden="true">＋</span> 新建主机</button></div>
+            </header>
+            <div class="host-manager-toolbar">
+              <label class="host-search"><span aria-hidden="true">⌕</span><input id="host-manager-search" type="search" placeholder="搜索名称、地址或用户" autocomplete="off"></label>
+              <span id="host-manager-count" class="host-manager-count"></span>
             </div>
-            <button id="quick-connect-new" class="quick-connect-new" type="button">➕ 新建连接</button>
-            <div class="quick-connect-label"><span>最近连接</span><span>服务器地址</span></div>
-            <div id="quick-connect-list" class="quick-connect-list"></div>
+            <div id="host-manager-list" class="host-manager-list"></div>
           </div>
         </section>
       </div>
@@ -96,7 +117,7 @@
 
   <dialog id="connect-dialog">
     <form id="connect-form" class="dialog-form">
-      <div class="dialog-title"><h2>新建 SSH 连接</h2><button type="button" class="dialog-close icon-btn">×</button></div>
+      <div class="dialog-title"><h2 id="connect-dialog-title">新建 SSH 连接</h2><button type="button" class="dialog-close icon-btn">×</button></div>
       <input type="hidden" name="server_id">
       <label>名称<input name="name" placeholder="生产服务器"></label>
       <div class="form-grid"><label>主机<input name="host" required placeholder="192.168.1.10"></label><label>端口<input name="port" required type="number" value="22" min="1" max="65535"></label></div>
@@ -106,8 +127,8 @@
       <label class="key-field hidden">密码库密钥<select name="ssh_key_id"><option value="">手动粘贴私钥</option></select><small>选择已导入密钥，或保留“手动粘贴”使用下方内容。</small></label>
       <label class="key-field manual-key-field hidden">私钥<textarea name="private_key" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label>
       <label class="key-field manual-key-field hidden">私钥口令<input name="passphrase" type="password"></label>
-      <label class="check"><input name="save" type="checkbox"> 保存服务器和加密凭据</label>
-      <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">连接</button></div>
+      <label id="connect-save-field" class="check"><input name="save" type="checkbox"> 保存服务器和加密凭据</label>
+      <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button id="connect-submit" class="primary" type="submit">连接</button></div>
     </form>
   </dialog>
   <dialog id="settings-dialog" class="settings-dialog">
@@ -146,7 +167,7 @@
           <div class="dialog-actions"><button id="mcp-install-cancel" type="button">取消</button><button id="mcp-install-submit" class="primary" type="button">连接并安装</button></div>
         </div>
         <div id="mcp-server-list" class="settings-list"></div>
-        <p class="muted">连接 SSH 后，在终端输入 <code>/agent 你的任务</code>。Agent 可读取并继续访问网页链接、执行多步命令，并在当前连接内保持多轮上下文。</p>
+        <p class="muted">左侧 Agent 用于完整聊天和长任务；终端 <code>/agent 帮我解决这个报错</code> 会附带上一条命令现场进行隔离的快速处置。</p>
         <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">保存 Agent 设置</button></div>
       </form>
       <section id="settings-theme" class="settings-panel">

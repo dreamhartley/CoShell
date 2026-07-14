@@ -3,16 +3,18 @@ import json
 import sqlite3
 import stat
 import sys
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from app.database import Database
-from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path
+from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path, normalize_remote_os
 from app.vault import Vault, VaultError
-from app.agent import AgentError, AgentRegistry, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
-from app.main import agent_message_with_terminal_context
+from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
+from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
+from app.main import agent_message_with_terminal_context, agents, terminal_agents
 from app.agent_workspace import AgentWorkspace
 from app.searxng_backend import _write_settings
 from app.mcp import normalize_mcp_url, search_tools
@@ -68,6 +70,11 @@ def test_backup_round_trip_keeps_encrypted_data_and_excludes_auto_unlock(tmp_pat
     content = create_backup(source)
     assert b"secret-password" not in content
     assert b"device-only-secret" not in content
+    assert parse_backup(content)["servers"][0]["os_type"] == "default"
+
+    legacy_document = json.loads(content)
+    legacy_document["tables"]["servers"][0].pop("os_type")
+    assert parse_backup(json.dumps(legacy_document).encode())["servers"][0]["os_type"] == "default"
 
     target = Database(tmp_path / "target.db")
     target.execute("INSERT INTO shortcuts(name,command) VALUES('old','false')")
@@ -255,6 +262,23 @@ def test_model_discovery_falls_back_to_v1(monkeypatch):
     assert resolved == "https://example.test/v1"
 
 
+def test_terminal_and_sidebar_agent_conversations_are_isolated():
+    assert agents is not terminal_agents
+    assert "快速定位当前故障" in QUICK_FIX_SYSTEM_PROMPT
+    assert "这不是普通聊天入口" in QUICK_FIX_SYSTEM_PROMPT
+    assert "左侧 Agent" not in QUICK_FIX_SYSTEM_PROMPT
+
+
+def test_agent_honors_a_pre_cancelled_task():
+    cancelled = threading.Event()
+    cancelled.set()
+    with pytest.raises(AgentCancelled, match="已停止"):
+        AgentRegistry().chat(
+            "cancelled", "检查错误", "https://example.test/v1", "key", "model", lambda *_: {},
+            cancel_event=cancelled,
+        )
+
+
 def test_agent_executes_tool_and_keeps_context(monkeypatch):
     replies = iter([
         {"choices": [{"message": {"content": "", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command":"uname -s"}'}}]}}]},
@@ -295,6 +319,63 @@ def test_agent_emits_live_command_events(monkeypatch):
         {"type": "command_start", "command": "whoami"},
         {"type": "command_end", "exit_code": 0, "stdout": "root\n", "stderr": ""},
     ]
+
+
+def test_agent_denied_command_is_not_executed(monkeypatch):
+    replies = iter([
+        {"choices": [{"message": {"content": "", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command":"rm -rf /tmp/demo"}'}}]}}]},
+        {"choices": [{"message": {"content": "已取消删除。"}}]},
+    ])
+    monkeypatch.setattr("app.agent.openai_request", lambda *args, **kwargs: next(replies))
+    commands = []
+    events = []
+    result = AgentRegistry().chat(
+        "ssh-denied", "删除目录", "https://example.test/v1", "key", "model",
+        lambda command, timeout: commands.append(command) or {},
+        command_approver=lambda _command: False,
+        on_event=events.append,
+    )
+    assert commands == []
+    assert events == [{"type": "command_denied", "command": "rm -rf /tmp/demo"}]
+    assert result["message"] == "已取消删除。"
+
+
+@pytest.mark.parametrize("command", [
+    "rm -rf /var/lib/demo",
+    "sudo -n sh -c 'rm -rf /var/lib/demo'",
+    "Remove-Item -Recurse -Force C:\\Temp\\demo",
+    "cmd.exe /c del /q C:\\Temp\\demo.txt",
+    "Format-Volume -DriveLetter D",
+    "shutdown.exe /r /t 0",
+    "git reset --hard HEAD~1",
+    "kubectl delete namespace demo",
+    "DROP DATABASE production",
+])
+def test_dangerous_command_detection_covers_common_operating_systems(command):
+    assert classify_dangerous_command(command) is not None
+
+
+@pytest.mark.parametrize("command", ["ls -la", "Get-ChildItem C:\\Temp", "git status", "systemctl status nginx"])
+def test_safe_commands_do_not_require_approval(command):
+    assert classify_dangerous_command(command) is None
+
+
+def test_agent_approval_registry_binds_decision_to_session():
+    registry = AgentApprovalRegistry()
+    approval_id = registry.create("ssh-1")
+    assert not registry.resolve("ssh-2", approval_id, True)
+    assert registry.resolve("ssh-1", approval_id, True)
+    assert registry.wait(approval_id) is True
+
+
+def test_agent_approval_registry_keeps_sidebar_and_terminal_scopes_isolated():
+    registry = AgentApprovalRegistry()
+    sidebar_id = registry.create("ssh-1", "sidebar")
+    terminal_id = registry.create("ssh-1", "terminal")
+    registry.cancel_session("ssh-1", "sidebar")
+    assert registry.wait(sidebar_id) is False
+    assert registry.resolve("ssh-1", terminal_id, True)
+    assert registry.wait(terminal_id) is True
 
 
 def test_agent_streams_answer_deltas(monkeypatch):
@@ -558,8 +639,23 @@ def test_database_additive_columns_exist(tmp_path):
     server_columns = {row["name"] for row in db.fetchall("PRAGMA table_info(servers)")}
     agent_columns = {row["name"] for row in db.fetchall("PRAGMA table_info(agent_settings)")}
     assert "ssh_key_id" in server_columns
+    assert "os_type" in server_columns
     assert "builtin_web_search" in agent_columns
     db.close()
+
+
+@pytest.mark.parametrize(("release", "expected"), [
+    ('NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\n', "ubuntu"),
+    ('PRETTY_NAME="Debian GNU/Linux"\nID=debian\n', "debian"),
+    ('NAME="Rocky Linux"\nID=rocky\nID_LIKE="rhel centos fedora"\n', "rocky"),
+    ('NAME="Alpine Linux"\nID=alpine\n', "alpine"),
+    ('ID=unknown\nID_LIKE=linux\n', "linux"),
+    ('ID=Darwin\n', "macos"),
+    ('Microsoft Windows [Version 10.0.20348.2402]', "windows"),
+    ('', "default"),
+])
+def test_remote_os_release_is_normalized_for_host_icons(release, expected):
+    assert normalize_remote_os(release) == expected
 
 
 def test_accepted_host_key_is_trusted_for_connection_retry(tmp_path):
