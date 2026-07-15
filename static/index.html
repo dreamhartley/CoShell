@@ -45,7 +45,7 @@
           </div>
         </div>
         <div id="agent-chat" class="agent-chat" aria-live="polite">
-          <div class="agent-welcome"><span>✦</span><strong>CoShell Agent</strong><p>选择一个已连接的终端，然后告诉我需要查询或执行的任务。</p></div>
+          <div class="agent-welcome"><span>✦</span><strong>SSH Agent</strong><p class="agent-welcome-prompt" aria-hidden="true"><span id="agent-welcome-prompt"></span></p></div>
         </div>
         <div id="agent-approval-popover" class="agent-approval-popover hidden" role="alertdialog" aria-labelledby="agent-approval-title" aria-describedby="agent-approval-reason">
           <div class="agent-approval-copy">
@@ -67,9 +67,9 @@
             <button id="agent-permission-confirm-yes" class="primary" type="button">是</button>
           </div>
         </div>
-        <form id="agent-chat-form" class="agent-composer">
+        <form id="agent-chat-form" class="agent-composer" autocomplete="off">
           <div class="agent-input-shell">
-            <textarea id="agent-chat-input" rows="4" maxlength="20000" placeholder="让 Agent 检查服务、部署项目，或附加终端现场…" aria-label="发送给 Agent 的消息"></textarea>
+            <textarea id="agent-chat-input" rows="4" maxlength="20000" placeholder="Enter 发送，Shift+Enter 换行" aria-label="发送给 Agent 的消息" autocomplete="off"></textarea>
             <button id="agent-permission-mode" class="agent-permission-mode" type="button" aria-label="Agent 权限模式" aria-haspopup="dialog" aria-controls="agent-permission-confirm" aria-expanded="false" title="切换 Agent 权限模式">请求批准</button>
             <button id="agent-attach-terminal" class="agent-attach-terminal" type="button" aria-label="附加终端内容到上下文" title="附加终端内容到上下文">&gt;_</button>
             <button id="agent-chat-send" class="agent-send primary" type="submit" aria-label="发送" title="发送">↑</button>
@@ -78,13 +78,13 @@
       </section>
       <section id="panel-sftp" class="side-panel">
         <div class="panel-head"><strong>SFTP</strong><button id="sftp-refresh" class="icon-btn" title="刷新">↻</button></div>
-        <div class="path-row"><button id="sftp-up" class="icon-btn">↑</button><input id="sftp-path" value="." aria-label="远程路径"><button id="sftp-go" class="soft-btn">前往</button></div>
+        <div class="path-row"><button id="sftp-up" class="icon-btn">↑</button><input id="sftp-path" value="." aria-label="远程路径" autocomplete="off"><button id="sftp-go" class="soft-btn">前往</button></div>
         <div class="file-actions"><button id="upload-btn">上传</button><button id="new-file-btn">新建文件</button><button id="mkdir-btn">新建目录</button><button id="batch-btn" class="hidden">批量操作</button><input id="upload-input" type="file" multiple hidden></div>
         <div id="file-list" class="file-list drop-zone"><div class="empty">连接 SSH 后浏览文件</div></div>
       </section>
       <section id="panel-shortcuts" class="side-panel">
-        <div class="panel-head"><strong>快捷指令</strong><button id="shortcut-add" class="icon-btn">＋</button></div>
-        <input id="shortcut-search" class="search" placeholder="搜索指令">
+        <div class="panel-head"><strong>快捷指令</strong><button id="shortcut-add" class="icon-btn" type="button" title="新建快捷指令" aria-label="新建快捷指令">＋</button></div>
+        <input id="shortcut-search" class="search" placeholder="搜索指令" autocomplete="off">
         <div id="shortcut-list" class="card-list"></div>
       </section>
     </aside>
@@ -97,7 +97,7 @@
         <div id="terminal-tabs" class="terminal-tabs"></div>
       </div>
       <div id="terminals" class="terminals">
-        <div id="welcome" class="welcome"><div class="welcome-icon">›_</div><h1>CoShell</h1><p>从主机库选择一台服务器，和 Agent 一起开始工作</p><button id="welcome-connect" class="primary">打开主机库</button></div>
+        <div id="welcome" class="welcome"><div class="welcome-icon">›_</div><h1>CoShell</h1><p id="welcome-greeting" aria-live="polite">早呀~我已经在线，准备好陪你建立今天的第一条连接。</p><button id="welcome-connect" class="primary">打开主机库</button></div>
         <section id="host-manager" class="host-manager hidden" aria-labelledby="host-manager-title">
           <div class="host-manager-shell">
             <header class="host-manager-head">
@@ -116,17 +116,17 @@
   </main>
 
   <dialog id="connect-dialog">
-    <form id="connect-form" class="dialog-form">
+    <form id="connect-form" class="dialog-form" autocomplete="off">
       <div class="dialog-title"><h2 id="connect-dialog-title">新建 SSH 连接</h2><button type="button" class="dialog-close icon-btn">×</button></div>
       <input type="hidden" name="server_id">
       <label>名称<input name="name" placeholder="生产服务器"></label>
       <div class="form-grid"><label>主机<input name="host" required placeholder="192.168.1.10"></label><label>端口<input name="port" required type="number" value="22" min="1" max="65535"></label></div>
-      <label>用户名<input name="username" required></label>
+      <label>用户名<input name="username" required autocomplete="off"></label>
       <label>认证方式<select name="auth_type"><option value="password">密码</option><option value="private_key">私钥</option></select></label>
       <label class="password-field">密码<input name="password" type="password" autocomplete="new-password"></label>
       <label class="key-field hidden">密码库密钥<select name="ssh_key_id"><option value="">手动粘贴私钥</option></select><small>选择已导入密钥，或保留“手动粘贴”使用下方内容。</small></label>
       <label class="key-field manual-key-field hidden">私钥<textarea name="private_key" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label>
-      <label class="key-field manual-key-field hidden">私钥口令<input name="passphrase" type="password"></label>
+      <label class="key-field manual-key-field hidden">私钥口令<input name="passphrase" type="password" autocomplete="new-password"></label>
       <label id="connect-save-field" class="check"><input name="save" type="checkbox"> 保存服务器和加密凭据</label>
       <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button id="connect-submit" class="primary" type="submit">连接</button></div>
     </form>
@@ -144,16 +144,16 @@
         <div class="setting-summary"><div><strong>凭据保险库</strong><p id="settings-vault-status" class="muted"></p></div><span id="settings-vault-indicator" class="status-pill"></span></div>
         <p class="muted">服务器密码、私钥以及 Agent API 密钥均使用主密码派生的密钥加密保存。</p>
         <div class="settings-section-title"><strong>SSH 私钥</strong><button id="ssh-key-import-toggle" type="button">导入密钥</button></div>
-        <form id="ssh-key-import-form" class="nested-form hidden">
+        <form id="ssh-key-import-form" class="nested-form hidden" autocomplete="off">
           <label>名称<input name="name" required maxlength="100" placeholder="例如：生产环境 Ed25519"></label>
           <label>选择私钥文件<input name="key_file" type="file" required></label>
-          <label>私钥口令（如有）<input name="passphrase" type="password"></label>
+          <label>私钥口令（如有）<input name="passphrase" type="password" autocomplete="new-password"></label>
           <div class="dialog-actions"><button type="button" id="ssh-key-import-cancel">取消</button><button class="primary" type="submit">加密导入</button></div>
         </form>
         <div id="ssh-key-list" class="settings-list"></div>
         <div class="dialog-actions"><button id="settings-vault-lock" type="button" class="danger">锁定</button><button id="settings-vault-unlock" type="button" class="primary">解锁 / 初始化</button></div>
       </section>
-      <form id="agent-settings-form" class="settings-panel">
+      <form id="agent-settings-form" class="settings-panel" autocomplete="off">
         <label>API 地址<input name="api_url" type="url" required placeholder="https://api.openai.com/v1"></label>
         <label>API 密钥<input name="api_key" type="password" autocomplete="new-password" placeholder="留空则继续使用已保存的密钥"><small id="agent-key-status">无鉴权的兼容接口可以留空。</small></label>
         <label>模型<div class="model-row"><select name="model" required><option value="">请先获取模型列表</option></select><button id="agent-models-refresh" type="button">获取模型</button></div><input name="model_custom" class="hidden" placeholder="输入模型 ID，例如 gpt-4.1"><small id="agent-models-status">支持基础地址，也支持粘贴完整的 /chat/completions 地址。</small></label>
@@ -167,7 +167,6 @@
           <div class="dialog-actions"><button id="mcp-install-cancel" type="button">取消</button><button id="mcp-install-submit" class="primary" type="button">连接并安装</button></div>
         </div>
         <div id="mcp-server-list" class="settings-list"></div>
-        <p class="muted">左侧 Agent 用于完整聊天和长任务；终端 <code>/agent 帮我解决这个报错</code> 会附带上一条命令现场进行隔离的快速处置。</p>
         <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">保存 Agent 设置</button></div>
       </form>
       <section id="settings-theme" class="settings-panel">
@@ -206,16 +205,16 @@
     </div>
   </dialog>
   <dialog id="vault-dialog">
-    <form id="vault-form" class="dialog-form">
+    <form id="vault-form" class="dialog-form" autocomplete="off">
       <div class="dialog-title"><h2>解锁保险库</h2><button type="button" class="dialog-close icon-btn">×</button></div>
       <p id="vault-help" class="muted"></p>
-      <label>主密码<input name="password" type="password" minlength="8" required autocomplete="current-password"></label>
+      <label>主密码<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
       <label class="check"><input name="remember" type="checkbox" checked> 在此 Windows 用户和设备上安全记住，重启应用后自动解锁</label>
       <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">确认</button></div>
     </form>
   </dialog>
   <dialog id="host-key-dialog" aria-labelledby="host-key-title">
-    <form id="host-key-form" class="dialog-form">
+    <form id="host-key-form" class="dialog-form" autocomplete="off">
       <div class="dialog-title"><h2 id="host-key-title">验证主机身份</h2></div>
       <p id="host-key-message" class="muted"></p>
       <dl class="host-key-details">
@@ -228,7 +227,7 @@
     </form>
   </dialog>
   <dialog id="editor-dialog">
-    <form id="editor-form" class="dialog-form">
+    <form id="editor-form" class="dialog-form" autocomplete="off">
       <div class="dialog-title"><h2 id="editor-title"></h2><button type="button" class="dialog-close icon-btn">×</button></div>
       <div id="editor-fields"></div>
       <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button class="primary" type="submit">保存</button></div>
@@ -240,12 +239,12 @@
         <div class="editor-file"><span class="editor-file-icon">◫</span><strong id="file-editor-name">文件编辑器</strong><span id="file-editor-dirty" class="dirty-dot hidden" title="未保存">●</span></div>
         <div class="editor-tools"><span id="file-editor-mode" class="muted"></span><button id="file-editor-reload">重新载入</button><button id="file-editor-save" class="primary">保存 <kbd>Ctrl+S</kbd></button><button id="file-editor-close" class="icon-btn">×</button></div>
       </header>
-      <div class="editor-body"><textarea id="file-editor-textarea"></textarea></div>
+      <div class="editor-body"><textarea id="file-editor-textarea" autocomplete="off"></textarea></div>
       <footer class="editor-status"><span id="file-editor-path"></span><span id="file-editor-position">Ln 1, Col 1</span><span id="file-editor-state">UTF-8</span></footer>
     </div>
   </dialog>
   <dialog id="app-prompt-dialog" class="app-prompt-dialog" aria-labelledby="app-prompt-title">
-    <form id="app-prompt-form" class="dialog-form">
+    <form id="app-prompt-form" class="dialog-form" autocomplete="off">
       <div class="dialog-title"><h2 id="app-prompt-title">请确认</h2><button id="app-prompt-close" type="button" class="icon-btn" aria-label="关闭">×</button></div>
       <p id="app-prompt-message" class="app-prompt-message"></p>
       <label id="app-prompt-field" class="hidden"><span id="app-prompt-label">输入内容</span><input id="app-prompt-input" autocomplete="off"></label>

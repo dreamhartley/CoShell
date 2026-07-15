@@ -275,18 +275,18 @@ def delete_ssh_key(key_id: int):
 
 @app.get("/api/shortcuts")
 def list_shortcuts():
-    return db.fetchall("SELECT * FROM shortcuts ORDER BY group_name,sort_order,id")
+    return db.fetchall("SELECT * FROM shortcuts ORDER BY sort_order,id")
 
 
 @app.post("/api/shortcuts")
 def create_shortcut(body: ShortcutBody):
-    cur = db.execute("INSERT INTO shortcuts(name,command,group_name,sort_order) VALUES(?,?,?,?)", (body.name, body.command, body.group_name, body.sort_order))
+    cur = db.execute("INSERT INTO shortcuts(name,command,sort_order) VALUES(?,?,?)", (body.name, body.command, body.sort_order))
     return db.fetchone("SELECT * FROM shortcuts WHERE id=?", (cur.lastrowid,))
 
 
 @app.put("/api/shortcuts/{item_id}")
 def update_shortcut(item_id: int, body: ShortcutBody):
-    db.execute("UPDATE shortcuts SET name=?,command=?,group_name=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (body.name, body.command, body.group_name, body.sort_order, item_id))
+    db.execute("UPDATE shortcuts SET name=?,command=?,group_name='',sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (body.name, body.command, body.sort_order, item_id))
     row = db.fetchone("SELECT * FROM shortcuts WHERE id=?", (item_id,))
     if not row:
         raise HTTPException(404, "快捷指令不存在")

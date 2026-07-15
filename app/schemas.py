@@ -23,9 +23,8 @@ class ServerBody(BaseModel):
 
 
 class ShortcutBody(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=30)
     command: str = Field(min_length=1, max_length=100000)
-    group_name: str = Field(default="", max_length=100)
     sort_order: int = 0
 
 

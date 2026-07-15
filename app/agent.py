@@ -129,6 +129,7 @@ def stream_chat_message(base_url: str, api_key: str, payload: dict[str, Any], on
     content: list[str] = []
     reasoning: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
+    preparing_file_calls: set[int] = set()
     received = False
     answer_started = False
     answer_cancelled = False
@@ -172,6 +173,16 @@ def stream_chat_message(base_url: str, api_key: str, payload: dict[str, Any], on
             function = call.get("function") or {}
             current["function"]["name"] += function.get("name") or ""
             current["function"]["arguments"] += function.get("arguments") or ""
+            if (
+                index not in preparing_file_calls
+                and current["id"]
+                and current["function"]["name"] == "workspace_write"
+            ):
+                preparing_file_calls.add(index)
+                on_event({
+                    "type": "local_tool_prepare", "id": current["id"],
+                    "tool": "workspace_write",
+                })
     finish_thinking()
     if not received:
         raise AgentError("AI API 未返回有效的流式回复")

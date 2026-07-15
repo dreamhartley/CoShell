@@ -10,6 +10,39 @@ def test_app_javascript_parses():
     quickjs.Context().eval(f"new Function({source!r})")
 
 
+def test_welcome_greeting_uses_local_time_periods_and_all_configured_copy():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    source = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="welcome-greeting"' in html
+    assert "从主机库选择一台服务器，和 Agent 一起开始工作" not in html
+    greetings_source = source[source.index("const WELCOME_GREETINGS="):source.index("function updateWelcomeGreeting")]
+    expected = [
+        "早呀~我已经在线，准备好陪你建立今天的第一条连接。",
+        "早上好。咖啡可以慢慢来，终端这边我帮你守着。",
+        "中午好。忙了一上午，记得给自己和服务器都喘口气。我在。",
+        "中午好～远程的世界还在转，这里可以安静一点。想连哪边？",
+        "嗨，下午好。还有主机要处理的话，我陪你；想歇一会儿也行。",
+        "下午好。午后容易犯困，终端这边我帮你盯着。需要连机还是排查？",
+        "嗨，傍晚好。想把今天的活儿收个尾，还是先歇会儿再说？",
+        "傍晚了。忙了一天，终于能喘口气了吧？我在。",
+        "嗨，晚上好。不着急下线的话，我陪你多待会儿。",
+        "晚上好。夜色下来了，终端的光刚好。今天想要做什么？",
+        "夜深了。终端可以继续连着，人不用，有情况我盯着。",
+        "凌晨了。如果你还醒着，那我就陪你一起加班一会儿。",
+    ]
+    for greeting in expected:
+        assert greeting in source
+
+    context = quickjs.Context()
+    values = context.eval(
+        greetings_source
+        + "JSON.stringify([4,5,10,11,13,14,17,18,19,20,23,0].map(hour=>"
+        + "WELCOME_GREETINGS.filter(item=>hour>=item.start).slice(-1)[0]?.start??0))"
+    )
+    assert values == "[0,5,5,11,11,14,14,18,18,20,20,0]"
+
+
 def test_theme_picker_exposes_all_themes_and_removes_quick_toggle():
     html = Path("static/index.html").read_text(encoding="utf-8")
     javascript = Path("static/app.js").read_text(encoding="utf-8")
@@ -48,6 +81,19 @@ def test_frontend_uses_themed_prompts_instead_of_browser_dialogs():
     assert "beforeunload" not in javascript
 
 
+def test_browser_autofill_is_disabled_for_forms_and_credentials():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+
+    forms = re.findall(r"<form\b[^>]*>", html)
+    assert forms
+    assert all('autocomplete="off"' in form for form in forms)
+    assert 'name="username" required autocomplete="off"' in html
+    assert 'name="password" type="password" minlength="8" required autocomplete="new-password"' in html
+    assert html.count('name="passphrase" type="password" autocomplete="new-password"') == 2
+    assert "input.autocomplete=type==='password'?'new-password':'off'" in javascript
+
+
 def test_server_deletion_offers_workspace_cleanup():
     javascript = Path("static/app.js").read_text(encoding="utf-8")
 
@@ -62,6 +108,33 @@ def test_terminal_has_custom_context_menu_actions():
     for label in ("复制", "粘贴", "Agent 命令", "全选终端内容", "清空终端显示", "断开连接", "重新连接"):
         assert f"label:'{label}'" in javascript
     assert "sendTerminalInput(tab,'/agent ')" in javascript
+
+
+def test_shortcuts_use_compact_rows_context_menu_and_code_editor():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+
+    shortcut_source = javascript[javascript.index("async function loadShortcuts"):javascript.index("function openEditor")]
+    assert "group_name" not in shortcut_source
+    assert "shortcut-row" in shortcut_source
+    assert "shortcut-menu-button" in shortcut_source
+    assert "row.oncontextmenu" in shortcut_source
+    assert "row.ondblclick" in shortcut_source
+    for label in ("编辑", "删除", "填入", "执行"):
+        assert f"label:'{label}'" in shortcut_source
+    assert 'id="shortcut-add"' in html
+    assert 'title="新建快捷指令"' in html
+    assert 'aria-label="新建快捷指令"' in html
+    assert "maxlength:30" in shortcut_source
+    assert "menu.textContent='⋮'" in shortcut_source
+    assert "'code'" in shortcut_source
+    assert "lineNumbers:true" in javascript
+    assert "Enter:shortcutEditorNewline" in javascript
+    assert "function shortcutEditorNewline" in javascript
+    assert "opensBlock" in javascript
+    assert ".shortcut-row" in css
+    assert ".shortcut-code-field .CodeMirror" in css
 
 
 def test_host_library_replaces_sidebar_server_panel_and_supports_card_actions():
@@ -83,7 +156,7 @@ def test_host_library_replaces_sidebar_server_panel_and_supports_card_actions():
     assert "{label:'删除',run:()=>deleteServer(server)}" in javascript
     assert "saveOnly:true" in javascript
     empty_state = javascript.split("root.innerHTML=query?", 1)[1].split(";", 1)[0]
-    assert '<strong>点击右上角新建主机</strong></div>' in empty_state
+    assert '<strong>点击右上新建主机</strong></div>' in empty_state
     assert 'class="host-manager-empty-icon"' in empty_state
     assert '<strong>没有匹配的主机</strong></div>' in empty_state
     assert "换一个名称、地址或用户名试试" not in empty_state
@@ -172,6 +245,13 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert 'id="agent-permission-confirm-no"' in html
     assert "启用Agent完全访问模式" in html
     assert 'title="附加终端内容到上下文"' in html
+    assert 'placeholder="Enter 发送，Shift+Enter 换行"' in html
+    assert "e.key==='Enter'&&!e.shiftKey" in javascript
+    assert "const AGENT_WELCOME_PROMPTS=[" in javascript
+    assert "'查询 GitHub 仓库文档并在服务器上部署'" in javascript
+    assert javascript.split("const AGENT_WELCOME_PROMPTS=[", 1)[1].split("];", 1)[0].count("',") == 10
+    assert "startAgentWelcomeTypewriter()" in javascript
+    assert ".agent-welcome-prompt::after" in css
     composer = html.split('id="agent-chat-form"', 1)[1].split("</form>", 1)[0]
     assert 'id="agent-attach-terminal"' in composer
     assert composer.index('id="agent-attach-terminal"') < composer.index('id="agent-chat-send"')
@@ -182,6 +262,9 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert "event.type==='answer_delta'" in javascript
     assert "process.currentText.text+=event.delta" in javascript
     assert "renderAgentChatMarkdown(entry.text)" in javascript
+    assert ".agent-message.user{width:auto;max-width:85%;align-self:flex-end;padding:9px 12px" in css
+    assert ".agent-message.assistant{align-self:stretch;padding:4px 2px;background:transparent" in css
+    assert ".agent-message.assistant{align-self:flex-start;background:var(--panel2)}" not in css
     assert "tab.agentActivity.output=" in javascript
     assert "tab.agentAbortController.signal" in javascript
     assert "send.textContent=busy?'■':'↑'" in javascript
@@ -259,6 +342,8 @@ def test_terminal_agent_is_an_isolated_contextual_quick_fix():
     assert "transform-origin:9px 9px" in css
     assert "event.type==='thinking_start'" in javascript
     assert "text:'正在思考'" in javascript
+    assert "event.type==='local_tool_prepare'" in javascript
+    assert "正在编辑文件：生成内容中…" in javascript
     assert "event.type==='local_tool_start'" in javascript
     assert "event.type==='local_tool_end'" in javascript
     assert "正在${action}" in javascript

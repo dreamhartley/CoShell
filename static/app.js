@@ -31,6 +31,23 @@ function showHostKeyDialog(ws,message){
 $('#host-key-form').addEventListener('submit',e=>{e.preventDefault();answerHostKey(true)});$('#host-key-cancel').onclick=()=>answerHostKey(false);$('#host-key-dialog').addEventListener('cancel',e=>{e.preventDefault();answerHostKey(false)});
 function esc(s=''){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function uid(){ return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`; }
+const WELCOME_GREETINGS=[
+  {start:0,messages:['夜深了。终端可以继续连着，人不用，有情况我盯着。','凌晨了。如果你还醒着，那我就陪你一起加班一会儿。']},
+  {start:5,messages:['早呀~我已经在线，准备好陪你建立今天的第一条连接。','早上好。咖啡可以慢慢来，终端这边我帮你守着。']},
+  {start:11,messages:['中午好。忙了一上午，记得给自己和服务器都喘口气。我在。','中午好～远程的世界还在转，这里可以安静一点。想连哪边？']},
+  {start:14,messages:['嗨，下午好。还有主机要处理的话，我陪你；想歇一会儿也行。','下午好。午后容易犯困，终端这边我帮你盯着。需要连机还是排查？']},
+  {start:18,messages:['嗨，傍晚好。想把今天的活儿收个尾，还是先歇会儿再说？','傍晚了。忙了一天，终于能喘口气了吧？我在。']},
+  {start:20,messages:['嗨，晚上好。不着急下线的话，我陪你多待会儿。','晚上好。夜色下来了，终端的光刚好。今天想要做什么？']}
+];
+function welcomeGreeting(date=new Date()){
+  const hour=date.getHours();let period=WELCOME_GREETINGS[0],periodIndex=0;
+  for(let i=1;i<WELCOME_GREETINGS.length&&hour>=WELCOME_GREETINGS[i].start;i++){period=WELCOME_GREETINGS[i];periodIndex=i}
+  const daySeed=date.getFullYear()*372+(date.getMonth()+1)*31+date.getDate()+periodIndex;
+  return period.messages[daySeed%period.messages.length]
+}
+function updateWelcomeGreeting(date=new Date()){const target=$('#welcome-greeting');if(target)target.textContent=welcomeGreeting(date)}
+updateWelcomeGreeting();
+setInterval(()=>updateWelcomeGreeting(),60_000);
 function activeTab(){ return state.tabs.find(t=>t.id===state.activeId); }
 function rawTerminalInput(tab,data){if(tab.ws?.readyState!==WebSocket.OPEN||tab.status!=='connected')return;const bytes=new TextEncoder().encode(data);let binary='';for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,i+0x8000));tab.ws.send(JSON.stringify({type:'input',encoding:'base64',data:btoa(binary)}))}
 function eraseTerminalCells(term,width){if(width>0)term.write('\b'.repeat(width)+' '.repeat(width)+'\b'.repeat(width))}
@@ -222,10 +239,31 @@ function answerAgentPermissionMode(enable){
 async function answerAgentApproval(approved){
   const tab=activeTab(),pending=tab?.agentApproval;if(!tab||!pending||pending.submitting)return;pending.submitting=true;renderAgentApproval(tab);try{await api('/api/agent/approval',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,approval_id:pending.approval_id,approved})});if(tab.agentApproval===pending)tab.agentApproval=null;renderAgentChat()}catch(err){if(tab.agentApproval===pending){pending.submitting=false;renderAgentApproval(tab)}toast(err.message,true)}
 }
+const AGENT_WELCOME_PROMPTS=[
+  '帮我看看服务器现在运行得怎么样',
+  '检查一下磁盘空间，找出占用最多的目录',
+  '查询 GitHub 仓库文档并在服务器上部署',
+  '帮我排查 Nginx 启动失败的原因',
+  '分析最近的错误日志并给出修复建议',
+  '检查网站是否正常，并定位访问变慢的原因',
+  '帮我配置 HTTPS 证书和自动续期',
+  '把本地配置文件上传到服务器并安全替换',
+  '查找最新版 Docker 安装方法并完成安装',
+  '整理这台服务器的安全风险和优化建议',
+];
+let agentWelcomePromptIndex=0,agentWelcomeTypewriterTimer=null;
+function stopAgentWelcomeTypewriter(){if(agentWelcomeTypewriterTimer!==null){clearTimeout(agentWelcomeTypewriterTimer);agentWelcomeTypewriterTimer=null}}
+function startAgentWelcomeTypewriter(){
+  stopAgentWelcomeTypewriter();const target=$('#agent-welcome-prompt');if(!target)return;
+  if(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches){target.textContent=AGENT_WELCOME_PROMPTS[agentWelcomePromptIndex];return}
+  let length=0,deleting=false;
+  const tick=()=>{if(!target.isConnected){agentWelcomeTypewriterTimer=null;return}const prompt=AGENT_WELCOME_PROMPTS[agentWelcomePromptIndex];length+=deleting?-1:1;target.textContent=prompt.slice(0,length);let delay=deleting?45:90;if(!deleting&&length===prompt.length){deleting=true;delay=1800}else if(deleting&&length===0){deleting=false;agentWelcomePromptIndex=(agentWelcomePromptIndex+1)%AGENT_WELCOME_PROMPTS.length;delay=320}agentWelcomeTypewriterTimer=setTimeout(tick,delay)};
+  tick()
+}
 function renderAgentChat(){
-  const tab=activeTab(),root=$('#agent-chat'),input=$('#agent-chat-input'),send=$('#agent-chat-send');root.replaceChildren();
+  const tab=activeTab(),root=$('#agent-chat'),input=$('#agent-chat-input'),send=$('#agent-chat-send');stopAgentWelcomeTypewriter();root.replaceChildren();
   $('#agent-session-label').textContent=tab?`${tab.title} · ${tab.status==='connected'?'已连接':'未连接'}`:'未连接终端';
-  if(!tab||!tab.agentChat.length){root.innerHTML='<div class="agent-welcome"><span>✦</span><strong>SSH Agent</strong><p>选择一个已连接的终端，然后告诉我需要查询或执行的任务。</p></div>'}
+  if(!tab||!tab.agentChat.length){root.innerHTML='<div class="agent-welcome"><span>✦</span><strong>SSH Agent</strong><p class="agent-welcome-prompt" aria-hidden="true"><span id="agent-welcome-prompt"></span></p></div>';startAgentWelcomeTypewriter()}
   else for(const entry of tab.agentChat){if(entry.kind==='process'){root.append(renderAgentProcess(entry));continue}const el=document.createElement('div');el.className=`agent-message ${entry.role}${entry.error?' error':''}`;el.append(renderAgentChatMarkdown(entry.text));root.append(el)}
   const disconnected=!tab||tab.status!=='connected',busy=!!tab?.agentBusy;input.disabled=disconnected||busy;send.disabled=disconnected;send.classList.toggle('primary',!busy);send.classList.toggle('stop',busy);send.textContent=busy?'■':'↑';send.setAttribute('aria-label',busy?'停止当前任务':'发送');send.title=busy?'停止当前任务':'发送';renderAgentApproval(tab);renderAgentPermissionMode(tab);root.scrollTop=root.scrollHeight
 }
@@ -241,7 +279,8 @@ function handleAgentChatEvent(tab,event){
   else if(event.type==='command_start'){const command=String(event.command||'').replace(/\s+/g,' ').trim();tab.agentActivity={type:'command',command,status:'running',text:`正在执行命令：${command}`,output:''};process?.items.push(tab.agentActivity);if(process)process.currentText=null;renderAgentChat()}
   else if(event.type==='command_output'&&tab.agentActivity){tab.agentActivity.output=(tab.agentActivity.output+String(event.data||'')).slice(-8000);renderAgentChat()}
   else if(event.type==='command_end'&&tab.agentActivity){const success=Number(event.exit_code)===0;tab.agentActivity.status=success?'done':'failed';tab.agentActivity.text=`${success?'命令执行完成':'命令执行失败'}：${tab.agentActivity.command}`;renderAgentChat()}
-  else if(event.type==='local_tool_start'){const item={type:'tool',status:'running',text:localAgentToolText(event,'start')};if(!tab.agentLocalActivities)tab.agentLocalActivities=new Map();tab.agentLocalActivities.set(event.id||`${event.tool}:${event.label}`,item);process?.items.push(item);if(process)process.currentText=null;renderAgentChat()}
+  else if(event.type==='local_tool_prepare'){const key=event.id||`preparing:${event.tool}`,item={type:'tool',tool:event.tool,status:'running',text:event.tool==='workspace_write'?'正在编辑文件：生成内容中…':'正在准备本地操作…'};if(!tab.agentLocalActivities)tab.agentLocalActivities=new Map();tab.agentLocalActivities.set(key,item);process?.items.push(item);if(process)process.currentText=null;renderAgentChat()}
+  else if(event.type==='local_tool_start'){const key=event.id||`${event.tool}:${event.label}`;if(!tab.agentLocalActivities)tab.agentLocalActivities=new Map();let item=tab.agentLocalActivities.get(key);if(item){item.text=localAgentToolText(event,'start')}else{item={type:'tool',tool:event.tool,status:'running',text:localAgentToolText(event,'start')};tab.agentLocalActivities.set(key,item);process?.items.push(item)}if(process)process.currentText=null;renderAgentChat()}
   else if(event.type==='local_tool_end'){const key=event.id||`${event.tool}:${event.label}`,item=tab.agentLocalActivities?.get(key);if(item){item.status=event.success?'done':'failed';item.text=localAgentToolText(event,'end');tab.agentLocalActivities.delete(key)}else process?.items.push({type:'tool',status:event.success?'done':'failed',text:localAgentToolText(event,'end')});renderAgentChat()}
   else if(event.type==='activity'){const names={search:'在线搜索',fetch:'读取网页',mcp:'调用 MCP',workspace:'访问本地 workspace',sftp:'SFTP 文件传输'};process?.items.push({type:'tool',status:'done',text:`${names[event.activity]||'执行工具'}：${event.label}`});renderAgentChat()}
   else if(event.type==='answer_delta'){if(process){if(!process.currentText){process.currentText={type:'text',text:''};process.items.push(process.currentText)}process.currentText.text+=event.delta||'';renderAgentChat()}}
@@ -494,7 +533,7 @@ function renderHostManager(){
     $('.host-card-more',card).onclick=event=>{event.stopPropagation();showHostMenu(event,server)};root.append(card)
   }
   if(!root.children.length){
-    root.innerHTML=query?'<div class="host-manager-empty"><span class="host-manager-empty-search" aria-hidden="true"></span><strong>没有匹配的主机</strong></div>':'<div class="host-manager-empty"><span class="host-manager-empty-icon" aria-hidden="true"></span><strong>点击右上角新建主机</strong></div>';
+    root.innerHTML=query?'<div class="host-manager-empty"><span class="host-manager-empty-search" aria-hidden="true"></span><strong>没有匹配的主机</strong></div>':'<div class="host-manager-empty"><span class="host-manager-empty-icon" aria-hidden="true"></span><strong>点击右上新建主机</strong></div>';
   }
 }
 $('#host-library-button').onclick=showHostManager;
@@ -522,12 +561,22 @@ function editServer(s){openEditor('编辑主机',[
 ],async d=>{await api(`/api/servers/${s.id}`,{method:'PUT',body:JSON.stringify({...d,port:Number(d.port),ssh_key_id:d.ssh_key_id?Number(d.ssh_key_id):null,password:d.password||null,private_key:d.private_key||null,passphrase:d.passphrase||null})});loadServers()})}
 
 async function loadShortcuts(){state.shortcuts=await api('/api/shortcuts');renderShortcuts()}
-function renderShortcuts(){const q=$('#shortcut-search').value.toLowerCase(),root=$('#shortcut-list');root.replaceChildren();state.shortcuts.filter(s=>`${s.name} ${s.command} ${s.group_name}`.toLowerCase().includes(q)).forEach(s=>{const card=document.createElement('div');card.className='card';card.innerHTML=`<div class="card-title">${esc(s.name)}</div><div class="card-sub">${esc(s.group_name||'未分组')} · ${esc(s.command.replace(/\n/g,' ↵ '))}</div><div class="card-actions"><button class="fill">填入</button><button class="run">执行</button><button class="edit">编辑</button><button class="delete danger">删除</button></div>`;$('.fill',card).onclick=()=>sendShortcut(s,false);$('.run',card).onclick=()=>sendShortcut(s,true);$('.edit',card).onclick=()=>editShortcut(s);$('.delete',card).onclick=async()=>{if(await themedConfirm(`删除“${s.name}”？`)){await api(`/api/shortcuts/${s.id}`,{method:'DELETE'});loadShortcuts()}};root.append(card)});if(!root.children.length)root.innerHTML='<div class="empty">暂无快捷指令</div>'}
+function shortcutActions(s){return [
+  {label:'编辑',run:()=>editShortcut(s)},
+  {label:'删除',run:()=>deleteShortcut(s)},
+  null,
+  {label:'填入',run:()=>sendShortcut(s,false)},
+  {label:'执行',run:()=>sendShortcut(s,true)}
+]}
+function showShortcutMenu(event,s){showContextMenu(event,shortcutActions(s))}
+async function deleteShortcut(s){if(await themedConfirm(`删除“${s.name}”？`)){await api(`/api/shortcuts/${s.id}`,{method:'DELETE'});await loadShortcuts()}}
+function renderShortcuts(){const q=$('#shortcut-search').value.trim().toLowerCase(),root=$('#shortcut-list');root.replaceChildren();state.shortcuts.filter(s=>`${s.name} ${s.command}`.toLowerCase().includes(q)).forEach(s=>{const row=document.createElement('div');row.className='shortcut-row';row.title=s.name;const name=document.createElement('span');name.className='shortcut-name';name.textContent=s.name;const menu=document.createElement('button');menu.type='button';menu.className='shortcut-menu-button';menu.textContent='⋮';menu.title='更多操作';menu.setAttribute('aria-label',`${s.name} 的更多操作`);menu.onclick=event=>{event.stopPropagation();const rect=menu.getBoundingClientRect();showShortcutMenu({preventDefault(){},clientX:rect.right,clientY:rect.bottom},s)};row.append(name,menu);row.ondblclick=event=>{if(!event.target.closest('button'))sendShortcut(s,true)};row.oncontextmenu=event=>showShortcutMenu(event,s);root.append(row)});if(!root.children.length)root.innerHTML='<div class="empty">暂无快捷指令</div>'}
 async function sendShortcut(s,run){const tab=activeTab();if(!tab||tab.status!=='connected')return toast('请先连接并选择一个终端',true);if(run&&s.command.includes('\n')&&!await themedConfirm('执行多行脚本？'))return;sendTerminalInput(tab,s.command+(run?'\n':''));tab.term.focus()}
-function editShortcut(s={}){openEditor(s.id?'编辑快捷指令':'新建快捷指令',[['name','名称',s.name||''],['group_name','分组',s.group_name||''],['command','命令或脚本',s.command||'','textarea']],async d=>{await api(s.id?`/api/shortcuts/${s.id}`:'/api/shortcuts',{method:s.id?'PUT':'POST',body:JSON.stringify({...d,sort_order:s.sort_order||0})});loadShortcuts()})}
+function editShortcut(s={}){openEditor(s.id?'编辑快捷指令':'新建快捷指令',[['name','名称',s.name||'','text',{maxlength:30,required:true,placeholder:'最多 30 个字符'}],['command','命令或脚本',s.command||'','code']],async d=>{await api(s.id?`/api/shortcuts/${s.id}`:'/api/shortcuts',{method:s.id?'PUT':'POST',body:JSON.stringify({...d,sort_order:s.sort_order||0})});loadShortcuts()})}
 $('#shortcut-search').oninput=renderShortcuts;$('#shortcut-add').onclick=()=>editShortcut();
 
-function openEditor(title,fields,submit){$('#editor-title').textContent=title;const root=$('#editor-fields');root.replaceChildren();fields.forEach(([name,label,value,type='text'])=>{const l=document.createElement('label');l.textContent=label;let input;if(type==='textarea'){input=document.createElement('textarea');input.rows=6}else if(type==='select'){input=document.createElement('select');input.innerHTML='<option value="password">密码</option><option value="private_key">私钥</option>'}else if(type==='sshkey'){input=document.createElement('select');input.add(new Option('不使用密码库密钥',''));for(const key of state.sshKeys)input.add(new Option(`${key.name} · ${key.key_type}`,String(key.id)))}else{input=document.createElement('input');input.type=type}input.name=name;input.value=value??'';l.append(input);root.append(l)});$('#editor-form').onsubmit=async e=>{e.preventDefault();try{await submit(Object.fromEntries(new FormData(e.target)));$('#editor-dialog').close();toast('已保存')}catch(err){toast(err.message,true)}};$('#editor-dialog').showModal()}
+function shortcutEditorNewline(editor){const cursor=editor.getCursor(),before=editor.getLine(cursor.line).slice(0,cursor.ch),leading=before.match(/^\s*/)?.[0]||'',opensBlock=/(?:\bthen|\bdo|\bin|\{|\(|\[)\s*$/.test(before.trimEnd()),extra=opensBlock?' '.repeat(editor.getOption('indentUnit')):'';editor.replaceSelection(`\n${leading}${extra}`,'end')}
+function openEditor(title,fields,submit){$('#editor-title').textContent=title;const root=$('#editor-fields'),dialog=$('#editor-dialog'),codeEditors=[];root.replaceChildren();dialog.classList.toggle('shortcut-editor-dialog',fields.some(field=>field[3]==='code'));fields.forEach(([name,label,value,type='text',options={}])=>{const l=document.createElement('label');const caption=document.createElement('span');caption.textContent=label;l.append(caption);let input;if(type==='textarea'||type==='code'){input=document.createElement('textarea');input.rows=type==='code'?10:6}else if(type==='select'){input=document.createElement('select');input.innerHTML='<option value="password">密码</option><option value="private_key">私钥</option>'}else if(type==='sshkey'){input=document.createElement('select');input.add(new Option('不使用密码库密钥',''));for(const key of state.sshKeys)input.add(new Option(`${key.name} · ${key.key_type}`,String(key.id)))}else{input=document.createElement('input');input.type=type}input.name=name;input.autocomplete=type==='password'?'new-password':'off';input.value=value??'';for(const [key,option] of Object.entries(options)){if(typeof option==='boolean')input[key]=option;else input.setAttribute(key,String(option))}if(type==='code')l.classList.add('shortcut-code-field');l.append(input);root.append(l);if(type==='code'){const cm=CodeMirror.fromTextArea(input,{mode:'shell',lineNumbers:true,indentUnit:2,tabSize:2,indentWithTabs:false,smartIndent:true,matchBrackets:true,styleActiveLine:true,lineWrapping:false,theme:themeModes[currentTheme()]==='dark'?'material-darker':'default',extraKeys:{Enter:shortcutEditorNewline,Tab:editor=>editor.somethingSelected()?editor.indentSelection('add'):editor.execCommand('insertSoftTab'),'Shift-Tab':editor=>editor.indentSelection('subtract')}});codeEditors.push(cm)}});$('#editor-form').onsubmit=async e=>{e.preventDefault();codeEditors.forEach(cm=>cm.save());try{const data=Object.fromEntries(new FormData(e.target));if(codeEditors.length&&!String(data.command||'').trim())throw new Error('请输入命令或脚本');await submit(data);dialog.close();toast('已保存')}catch(err){toast(err.message,true)}};dialog.showModal();setTimeout(()=>{codeEditors.forEach(cm=>cm.refresh());(codeEditors[0]||$('input,textarea,select',root))?.focus()},30)}
 
 async function loadSftp(path){const tab=activeTab(),root=$('#file-list');if(!tab?.sessionId){root.innerHTML='<div class="empty">连接 SSH 后浏览文件</div>';return}path=path||$('#sftp-path').value||tab.last_path||'.';root.innerHTML='<div class="empty">正在加载…</div>';try{const data=await api(`/api/sftp/list?session_id=${encodeURIComponent(tab.sessionId)}&path=${encodeURIComponent(path)}`);tab.last_path=data.path;$('#sftp-path').value=data.path;saveTabs();renderFiles(data.items)}catch(err){root.innerHTML=`<div class="empty">${esc(err.message)}</div>`}}
 function renderFiles(items){const root=$('#file-list');root.replaceChildren();state.selectedFiles.clear();updateBatch();items.forEach(item=>{const row=document.createElement('div');row.className='file-row';row.innerHTML=`<input type="checkbox" aria-label="选择 ${esc(item.name)}"><span>${item.is_dir?'📁':'📄'}</span><span class="file-name" title="${esc(item.name)}">${esc(item.name)}</span><span class="file-size">${item.is_dir?'':formatSize(item.size)}</span>`;const check=$('input',row);check.onchange=()=>{check.checked?state.selectedFiles.add(item):state.selectedFiles.delete(item);updateBatch()};row.ondblclick=e=>{if(e.target!==check)(item.is_dir?loadSftp(joinRemote(activeTab().last_path,item.name)):openFileEditor(joinRemote(activeTab().last_path,item.name)))};row.oncontextmenu=e=>showFileMenu(e,item);root.append(row)});const tab=activeTab();for(const task of state.uploadTasks.values())if(task.tabId===tab?.id&&task.directory===tab.last_path)renderUploadTask(task);if(!root.children.length)root.innerHTML='<div class="empty">空目录</div>'}

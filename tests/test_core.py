@@ -14,6 +14,7 @@ from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry
 from app.vault import Vault, VaultError
 from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
+from app.schemas import ShortcutBody
 from app.main import agent_message_with_terminal_context, agents, terminal_agents
 from app.agent_workspace import AgentWorkspace
 from app.searxng_backend import _write_settings
@@ -98,6 +99,12 @@ def test_invalid_backup_is_rejected_without_changing_database(tmp_path):
         restore_backup(db, b'{"format":"wrong"}')
     assert db.fetchone("SELECT name FROM shortcuts") == {"name": "keep"}
     db.close()
+
+
+def test_shortcut_name_is_limited_to_30_characters():
+    assert ShortcutBody(name="x" * 30, command="true").name == "x" * 30
+    with pytest.raises(ValueError):
+        ShortcutBody(name="x" * 31, command="true")
 
 
 @pytest.mark.parametrize(("raw", "expected"), [
@@ -391,6 +398,34 @@ def test_agent_streams_answer_deltas(monkeypatch):
         {"type": "answer_delta", "delta": "你好"},
         {"type": "answer_delta", "delta": "，世界"},
     ]
+
+
+def test_agent_reports_file_edit_while_streaming_workspace_write_arguments(monkeypatch):
+    chunks = [
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "write-1", "type": "function",
+            "function": {"name": "workspace_", "arguments": ""},
+        }]}}]},
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "function": {"name": "write", "arguments": '{"path":"index.html","content":"'},
+        }]}}]},
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "function": {"arguments": "<main>正在生成的较长网页</main>"},
+        }]}}]},
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "function": {"arguments": '"}'},
+        }]}}]},
+    ]
+    monkeypatch.setattr("app.agent.openai_stream_request", lambda *_args, **_kwargs: iter(chunks))
+    events = []
+
+    message = stream_chat_message("https://example.test/v1", "key", {"model": "model"}, events.append)
+
+    assert events == [{"type": "local_tool_prepare", "id": "write-1", "tool": "workspace_write"}]
+    assert message["tool_calls"][0]["function"] == {
+        "name": "workspace_write",
+        "arguments": '{"path":"index.html","content":"<main>正在生成的较长网页</main>"}',
+    }
 
 
 def test_glm_and_deepseek_thinking_is_hidden_but_preserved(monkeypatch):
