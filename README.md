@@ -36,7 +36,7 @@ CoShell 面向个人电脑和可信网络环境。应用默认仅监听本机地
 
 ### 使用发行版
 
-从 GitHub Releases 下载 Windows x64 便携版，完整解压后运行 `CoShell.exe`。程序无需安装 Python；请勿单独移动 EXE 或直接在压缩包内运行。
+可直接从 [GitHub Releases](https://github.com/dreamhartley/CoShell/releases) 下载已经构建好的 Windows x64 便携程序包，无需自行构建。完整解压后运行 `CoShell.exe`，程序无需安装 Python；请勿单独移动 EXE 或直接在压缩包内运行。
 
 首次启动需要创建至少 8 位的保险库主密码。主密码不会写入磁盘，遗失后无法恢复。
 
