@@ -1,19 +1,75 @@
-# CoShell
+<p align="center">
+  <img src="assets/app-icon.png" width="180" alt="CoShell 项目图标">
+</p>
 
-面向个人本机或可信内网的多标签桌面 SSH/SFTP 客户端。后端基于 FastAPI 与 Paramiko，桌面窗口使用 pywebview，前端使用原生 JavaScript 与本地 xterm.js。
+<h1 align="center">CoShell</h1>
 
-## 功能
+<p align="center">
+  <strong>安全、现代且可扩展的桌面 SSH / SFTP 工作台</strong>
+</p>
 
-- 多标签 SSH 会话，支持排序、重命名、断开后恢复
-- 密码与 OpenSSH 私钥认证，首次连接主机指纹确认
-- SFTP 浏览、分块上传、拖拽上传、下载、新建、移动、复制、重命名和递归删除
-- 内置 CodeMirror 文本编辑器，支持语法高亮、自动缩进、括号匹配与 `Ctrl+S` 原子保存
-- 保存的服务器与快捷命令/脚本
-- Argon2id + AES-GCM 本地凭据保险库
-- OpenAI 兼容的终端 Agent，可自动获取模型并通过 SSH 多步执行命令
-- 零配置内置 SearXNG 搜索后端，支持多搜索引擎聚合与网页读取
-- 明亮/黑暗主题，终端配色即时同步
-- 设置内一键备份/还原连接、快捷命令、主题、加密凭据及 Agent/MCP 配置
+<p align="center">
+  将远程终端、文件管理、文本编辑与 AI Agent 汇集在一个本地优先的桌面应用中。
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/FastAPI-0.116-009688?logo=fastapi&logoColor=white" alt="FastAPI 0.116">
+  <img src="https://img.shields.io/badge/Paramiko-3.5-2C2D72" alt="Paramiko 3.5">
+  <img src="https://img.shields.io/badge/pywebview-6.1-4B8BBE" alt="pywebview 6.1">
+  <img src="https://img.shields.io/badge/xterm.js-5.3-000000?logo=gnometerminal&logoColor=white" alt="xterm.js 5.3">
+  <img src="https://img.shields.io/badge/CodeMirror-5.65-D30707" alt="CodeMirror 5.65">
+  <img src="https://img.shields.io/badge/SearXNG-bundled-3050FF?logo=searxng&logoColor=white" alt="Bundled SearXNG">
+  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
+</p>
+
+<p align="center">
+  <a href="#功能亮点">功能亮点</a> ·
+  <a href="#技术栈">技术栈</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#数据与安全">数据与安全</a> ·
+  <a href="#agent">Agent</a> ·
+  <a href="#打包发布">打包发布</a>
+</p>
+
+---
+
+CoShell 面向个人电脑与可信内网环境，提供多标签 SSH 会话、完整 SFTP 文件操作、本地凭据保险库和具备远程执行能力的 AI Agent。应用默认仅监听本机回环地址，核心前端依赖随程序分发，日常使用无需浏览器、Docker 或外部 CDN。
+
+## 功能亮点
+
+| 模块 | 能力 |
+| --- | --- |
+| **远程终端** | 多标签 SSH 会话、标签排序与重命名、断开恢复、自适应终端尺寸 |
+| **文件工作区** | SFTP 浏览、分块与拖拽上传、下载、新建、移动、复制、重命名及递归删除 |
+| **在线编辑** | 内置 CodeMirror，支持语法高亮、自动缩进、括号匹配与 `Ctrl+S` 原子保存 |
+| **连接管理** | 保存服务器、复用 SSH 密钥、快捷命令与脚本、首次连接主机指纹确认 |
+| **安全存储** | Argon2id 密钥派生、AES-GCM 凭据加密、Windows DPAPI 可选自动解锁 |
+| **AI Agent** | OpenAI 兼容 API、多轮远程任务、命令风险审批、workspace / SFTP / MCP 工具 |
+| **本地搜索** | 随附 SearXNG sidecar，聚合多搜索引擎并支持网页内容读取 |
+| **桌面体验** | 原生桌面窗口、明暗主题、终端配色同步、配置备份与还原 |
+
+## 技术栈
+
+| 层级 | 主要技术 | 用途 |
+| --- | --- | --- |
+| **桌面容器** | pywebview | 提供轻量原生窗口与桌面生命周期管理 |
+| **应用后端** | Python · FastAPI · Uvicorn | 本地 API、WebSocket 会话和业务编排 |
+| **远程连接** | Paramiko | SSH 终端、主机密钥校验与 SFTP 操作 |
+| **前端界面** | HTML · CSS · Vanilla JavaScript | 无构建步骤的本地优先界面 |
+| **终端与编辑器** | xterm.js · CodeMirror | 终端渲染、尺寸适配与代码编辑 |
+| **安全组件** | cryptography · Argon2id · AES-GCM · DPAPI | 凭据加密、密钥派生与设备绑定 |
+| **Agent 与搜索** | OpenAI-compatible API · MCP · SearXNG | AI 任务执行、工具扩展与本地聚合搜索 |
+
+```text
+pywebview Desktop
+       │
+       ├── FastAPI / WebSocket ── Paramiko ── SSH & SFTP servers
+       │
+       ├── Local encrypted vault ── Argon2id + AES-GCM
+       │
+       └── AI Agent ── OpenAI-compatible API / MCP / SearXNG
+```
 
 ## 快速开始
 
