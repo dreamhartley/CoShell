@@ -20,6 +20,10 @@
 
 CoShell 面向个人电脑和可信网络环境。应用默认仅监听本机地址，前端资源与搜索服务均随程序分发，无需浏览器、Docker 或外部 CDN。
 
+<p align="center">
+  <img src="assets/screenshots/coshell-main-interface.jpg" alt="CoShell 主界面">
+</p>
+
 ## 功能
 
 | 模块 | 主要能力 |
