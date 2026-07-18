@@ -15,7 +15,7 @@ from app.vault import Vault, VaultError
 from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
 from app.schemas import ShortcutBody
-from app.main import agent_message_with_terminal_context, agents, terminal_agents
+from app.main import agent_message_with_terminal_context, agent_workspace_executor, agents, terminal_agents
 from app.agent_workspace import AgentWorkspace
 from app.searxng_backend import _write_settings
 from app.mcp import normalize_mcp_url, search_tools
@@ -251,6 +251,87 @@ def test_agent_workspace_is_isolated_per_server_and_can_be_deleted(tmp_path):
     assert workspace.delete_server_workspace(1)
     assert not (tmp_path / "workspace" / "server-1").exists()
     assert (tmp_path / "workspace" / "server-2" / "same.txt").is_file()
+
+
+def test_agent_workspace_root_tools_share_and_persist_files_across_servers(tmp_path):
+    sessions = {
+        "one": SimpleNamespace(sftp=MemorySftp(), server_id=1, host="one.test", port=22, username="root"),
+        "two": SimpleNamespace(sftp=MemorySftp(), server_id=2, host="two.test", port=22, username="root"),
+    }
+    workspace = AgentWorkspace(tmp_path / "workspace", sessions.__getitem__)
+
+    written = workspace.execute("one", "workspace_root_write", {
+        "path": "shared/deploy.sh", "content": "#!/bin/sh\necho shared\n",
+    })
+    assert written["path"] == "shared/deploy.sh"
+    assert workspace.execute("two", "workspace_root_read", {"path": "shared/deploy.sh"})["content"].endswith("echo shared\n")
+    assert workspace.execute("two", "workspace_root_list", {"path": "shared"})["entries"][0]["name"] == "deploy.sh"
+
+    uploaded = workspace.execute("two", "workspace_root_sftp_transfer", {
+        "direction": "upload", "local_path": "shared/deploy.sh", "remote_path": "/tmp/deploy.sh",
+    })
+    assert uploaded["size"] == len(b"#!/bin/sh\necho shared\n")
+    assert sessions["two"].sftp.files["/tmp/deploy.sh"].endswith(b"echo shared\n")
+
+    workspace.execute("one", "workspace_write", {"path": "temporary.txt", "content": "temporary"})
+    assert workspace.delete_server_workspace(1)
+    assert (tmp_path / "workspace" / "shared" / "deploy.sh").is_file()
+    with pytest.raises(ValueError, match="不能离开"):
+        workspace.execute("two", "workspace_root_read", {"path": "../outside.txt"})
+
+
+def test_workspace_root_access_approval_is_scoped_to_one_agent_task(monkeypatch):
+    class FakeApprovals:
+        def __init__(self):
+            self.created = []
+            self.waited = []
+
+        def create(self, session_id, scope):
+            self.created.append((session_id, scope))
+            return "approval-id"
+
+        def wait(self, approval_id, cancel_event):
+            self.waited.append((approval_id, cancel_event))
+            return True
+
+    approvals = FakeApprovals()
+    calls = []
+    events = []
+    monkeypatch.setattr("app.main.agent_approvals", approvals)
+    monkeypatch.setattr("app.main.agent_workspace", SimpleNamespace(
+        execute=lambda session_id, tool, arguments: calls.append((session_id, tool, arguments)) or {"path": arguments.get("path", ".")}
+    ))
+
+    execute = agent_workspace_executor("ssh-1", events.append)
+    execute("workspace_list", {"path": "."})
+    execute("workspace_root_list", {"path": "."})
+    execute("workspace_root_read", {"path": "shared/deploy.sh"})
+
+    assert approvals.created == [("ssh-1", "sidebar")]
+    assert approvals.waited == [("approval-id", None)]
+    assert [event["type"] for event in events] == ["command_approval_required", "command_approval_resolved"]
+    assert events[0]["category"] == "workspace_root"
+    assert len(calls) == 3
+
+
+def test_workspace_root_access_rejection_never_calls_workspace(monkeypatch):
+    approvals = SimpleNamespace(
+        create=lambda _session_id, _scope: "approval-id",
+        wait=lambda _approval_id, _cancel_event: False,
+    )
+    calls = []
+    events = []
+    monkeypatch.setattr("app.main.agent_approvals", approvals)
+    monkeypatch.setattr("app.main.agent_workspace", SimpleNamespace(
+        execute=lambda *args: calls.append(args)
+    ))
+
+    execute = agent_workspace_executor("ssh-1", events.append)
+    with pytest.raises(PermissionError, match="用户拒绝"):
+        execute("workspace_root_read", {"path": "shared/deploy.sh"})
+
+    assert calls == []
+    assert events[-1] == {"type": "command_approval_resolved", "approval_id": "approval-id", "approved": False}
 
 
 def test_openai_url_accepts_compatible_base_url():
@@ -525,7 +606,11 @@ def test_agent_prompt_includes_local_date_and_workspace_tools(monkeypatch):
         local_executor=local_executor, on_event=events.append,
     )
     names = {tool["function"]["name"] for tool in payloads[0]["tools"]}
-    assert names >= {"workspace_list", "workspace_read", "workspace_write", "sftp_transfer"}
+    assert names >= {
+        "workspace_list", "workspace_read", "workspace_write", "sftp_transfer",
+        "workspace_root_list", "workspace_root_read", "workspace_root_write", "workspace_root_sftp_transfer",
+    }
+    assert "只有当用户在当前消息中明确要求访问共享 workspace 根目录" in payloads[0]["messages"][0]["content"]
     assert datetime.now().astimezone().date().isoformat() in payloads[0]["messages"][0]["content"]
     assert local_calls == [("workspace_list", {"path": "."})]
     assert result["steps"] == [{"tool": "workspace_list", "path": "."}]

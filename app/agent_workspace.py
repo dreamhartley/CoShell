@@ -152,8 +152,19 @@ class AgentWorkspace:
     def sftp_transfer(
         self, session_id: str, direction: Any, local_path: Any, remote_path: Any, overwrite: bool = False
     ) -> dict[str, Any]:
+        return self._sftp_transfer(
+            session_id, direction, local_path, remote_path, overwrite, self._session_root(session_id)
+        )
+
+    def workspace_root_sftp_transfer(
+        self, session_id: str, direction: Any, local_path: Any, remote_path: Any, overwrite: bool = False
+    ) -> dict[str, Any]:
+        return self._sftp_transfer(session_id, direction, local_path, remote_path, overwrite, self.root)
+
+    def _sftp_transfer(
+        self, session_id: str, direction: Any, local_path: Any, remote_path: Any, overwrite: bool, root: Path
+    ) -> dict[str, Any]:
         operation = str(direction or "").strip().lower()
-        root = self._session_root(session_id)
         local = self._path(local_path, root=root)
         remote = clean_remote_path(str(remote_path or "").strip())
         if operation == "upload":
@@ -250,6 +261,22 @@ class AgentWorkspace:
             return self.write(arguments.get("path"), arguments.get("content"), bool(arguments.get("overwrite", False)), root=root)
         if tool_name == "sftp_transfer":
             return self.sftp_transfer(
+                session_id,
+                arguments.get("direction"),
+                arguments.get("local_path"),
+                arguments.get("remote_path"),
+                bool(arguments.get("overwrite", False)),
+            )
+        if tool_name == "workspace_root_list":
+            return self.list(arguments.get("path", "."), root=self.root)
+        if tool_name == "workspace_root_read":
+            return self.read(arguments.get("path"), root=self.root)
+        if tool_name == "workspace_root_write":
+            return self.write(
+                arguments.get("path"), arguments.get("content"), bool(arguments.get("overwrite", False)), root=self.root
+            )
+        if tool_name == "workspace_root_sftp_transfer":
+            return self.workspace_root_sftp_transfer(
                 session_id,
                 arguments.get("direction"),
                 arguments.get("local_path"),

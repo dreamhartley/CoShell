@@ -568,6 +568,40 @@ def agent_command_approver(
     return approve
 
 
+def agent_workspace_executor(
+    session_id: str,
+    emit,
+    cancel_event: threading.Event | None = None,
+):
+    """Build a task-scoped local tool executor with an explicit shared-root gate."""
+    root_access_approved = False
+    root_tools = {
+        "workspace_root_list", "workspace_root_read", "workspace_root_write", "workspace_root_sftp_transfer",
+    }
+
+    def execute(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        nonlocal root_access_approved
+        if tool_name in root_tools and not root_access_approved:
+            approval_id = agent_approvals.create(session_id, "sidebar")
+            target = str(arguments.get("local_path") or arguments.get("path") or ".")
+            emit({
+                "type": "command_approval_required",
+                "approval_id": approval_id,
+                "title": "请求访问共享 workspace 根目录",
+                "command": f"{tool_name} · {target}",
+                "category": "workspace_root",
+                "reason": "仅当你明确要求 Agent 使用所有服务器 workspace 的上一级时才批准；权限只在本次任务中有效。",
+            })
+            approved = agent_approvals.wait(approval_id, cancel_event)
+            emit({"type": "command_approval_resolved", "approval_id": approval_id, "approved": approved})
+            if not approved:
+                raise PermissionError("用户拒绝访问共享 workspace 根目录")
+            root_access_approved = True
+        return agent_workspace.execute(session_id, tool_name, arguments)
+
+    return execute
+
+
 def agent_message_with_terminal_context(message: str, terminal_context: str | None) -> str:
     context = (terminal_context or "").strip()
     if not context:
@@ -646,7 +680,7 @@ async def agent_chat_stream(body: AgentChatBody):
                     body.session_id, agent_message_with_terminal_context(body.message, body.terminal_context), config["api_url"], key, config["model"], execute,
                     builtin_web_search=bool(config.get("builtin_web_search", 1)),
                     mcp_tools=tools, mcp_executor=execute_mcp_tool,
-                    local_executor=lambda tool, arguments: agent_workspace.execute(body.session_id, tool, arguments),
+                    local_executor=agent_workspace_executor(body.session_id, emit, cancel_event),
                     command_approver=agent_command_approver(body.session_id, body.permission_mode, emit, cancel_event),
                     on_event=emit, stream_response=True, cancel_event=cancel_event,
                 )
