@@ -10,9 +10,12 @@ import stat
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import paramiko
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 
 from .database import Database
 
@@ -55,6 +58,52 @@ def parse_private_key(value: str, passphrase: str | None) -> paramiko.PKey:
         except Exception as exc:
             errors.append(str(exc))
     raise ValueError("无法解析私钥，请检查格式或口令")
+
+
+def create_ssh_key_pair(key_type: str, rsa_bits: int, passphrase: str | None, comment: str = "") -> tuple[str, str]:
+    """Create an OpenSSH private/public key pair without invoking ssh-keygen."""
+    if key_type == "ed25519":
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    elif key_type == "rsa" and rsa_bits in (2048, 3072, 4096):
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=rsa_bits)
+    else:
+        raise ValueError("不支持的 SSH 密钥类型或长度")
+    encryption = serialization.BestAvailableEncryption(passphrase.encode("utf-8")) if passphrase else serialization.NoEncryption()
+    private_text = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.OpenSSH,
+        encryption,
+    ).decode("utf-8").rstrip("\n") + "\n"
+    public_text = private_key.public_key().public_bytes(
+        serialization.Encoding.OpenSSH,
+        serialization.PublicFormat.OpenSSH,
+    ).decode("ascii")
+    if comment:
+        public_text += " " + comment.replace("\r", " ").replace("\n", " ").strip()
+    return private_text, public_text + "\n"
+
+
+def save_ssh_key_pair(directory: Path, file_name: str, private_key: str, public_key: str) -> tuple[Path, Path]:
+    """Save both files exclusively so an existing key is never overwritten."""
+    directory.mkdir(parents=True, exist_ok=True)
+    private_path = directory / file_name
+    public_path = directory / f"{file_name}.pub"
+    if private_path.exists() or public_path.exists():
+        raise FileExistsError("同名密钥文件已存在")
+    try:
+        with private_path.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(private_key)
+        try:
+            private_path.chmod(0o600)
+        except OSError:
+            pass
+        with public_path.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(public_key)
+    except Exception:
+        private_path.unlink(missing_ok=True)
+        public_path.unlink(missing_ok=True)
+        raise
+    return private_path, public_path
 
 
 def clean_remote_path(path: str) -> str:

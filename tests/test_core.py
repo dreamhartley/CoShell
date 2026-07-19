@@ -10,11 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from app.database import Database
-from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path, normalize_remote_os
+from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path, create_ssh_key_pair, normalize_remote_os, parse_private_key, save_ssh_key_pair
 from app.vault import Vault, VaultError
 from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
-from app.schemas import ShortcutBody
+from app.schemas import SSHKeyGenerateBody, ShortcutBody
+from app import main as main_app
 from app.main import agent_message_with_terminal_context, agent_workspace_executor, agents, terminal_agents
 from app.agent_workspace import AgentWorkspace
 from app.searxng_backend import _write_settings
@@ -105,6 +106,57 @@ def test_shortcut_name_is_limited_to_30_characters():
     assert ShortcutBody(name="x" * 30, command="true").name == "x" * 30
     with pytest.raises(ValueError):
         ShortcutBody(name="x" * 31, command="true")
+
+
+@pytest.mark.parametrize(("key_type", "rsa_bits", "expected"), [
+    ("ed25519", 3072, "ssh-ed25519"),
+    ("rsa", 2048, "ssh-rsa"),
+])
+def test_generated_ssh_key_pair_round_trips_and_saves_exclusively(tmp_path, key_type, rsa_bits, expected):
+    private_key, public_key = create_ssh_key_pair(key_type, rsa_bits, "key password", "test key")
+    assert parse_private_key(private_key, "key password").get_name() == expected
+    assert public_key.startswith(expected + " ") and public_key.rstrip().endswith("test key")
+    private_path, public_path = save_ssh_key_pair(tmp_path / "ssh-keys", "id_test", private_key, public_key)
+    assert private_path.read_text(encoding="utf-8") == private_key
+    assert public_path.read_text(encoding="utf-8") == public_key
+    with pytest.raises(FileExistsError):
+        save_ssh_key_pair(tmp_path / "ssh-keys", "id_test", private_key, public_key)
+
+
+def test_generate_ssh_key_saves_under_data_and_auto_imports(monkeypatch, tmp_path):
+    database = Database(tmp_path / "webssh.db")
+    test_vault = Vault(database)
+    test_vault.initialize("test master password")
+    monkeypatch.setattr(main_app, "DATA", tmp_path)
+    monkeypatch.setattr(main_app, "db", database)
+    monkeypatch.setattr(main_app, "vault", test_vault)
+
+    result = main_app.generate_ssh_key(SSHKeyGenerateBody(
+        name="Generated key", file_name="id_generated", key_type="ed25519",
+        passphrase="private password", auto_import=True,
+    ))
+
+    assert result["imported"]["name"] == "Generated key"
+    assert result["private_key_path"] == str(tmp_path / "ssh-keys" / "id_generated")
+    assert (tmp_path / "ssh-keys" / "id_generated.pub").read_text(encoding="utf-8").startswith("ssh-ed25519 ")
+    row = database.fetchone("SELECT private_key_enc,passphrase_enc FROM ssh_keys WHERE name='Generated key'")
+    assert parse_private_key(test_vault.decrypt(row["private_key_enc"]), test_vault.decrypt(row["passphrase_enc"])).get_name() == "ssh-ed25519"
+
+    test_vault.lock()
+    file_only = main_app.generate_ssh_key(SSHKeyGenerateBody(
+        name="File only", file_name="id_file_only", auto_import=False,
+    ))
+    assert file_only["imported"] is None
+    assert (tmp_path / "ssh-keys" / "id_file_only").is_file()
+    assert database.fetchone("SELECT id FROM ssh_keys WHERE name='File only'") is None
+
+    test_vault.unlock("test master password")
+    automatic = main_app.generate_ssh_key(SSHKeyGenerateBody())
+    assert automatic["name"] == automatic["file_name"]
+    assert automatic["file_name"].startswith("id_ed25519_")
+    assert (tmp_path / "ssh-keys" / automatic["file_name"]).is_file()
+    assert automatic["imported"]["name"] == automatic["name"]
+    database.close()
 
 
 @pytest.mark.parametrize(("raw", "expected"), [

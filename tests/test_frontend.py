@@ -70,6 +70,19 @@ def test_settings_exposes_backup_and_restore_controls():
     assert "themedConfirm('还原会整体替换" in javascript
 
 
+def test_settings_can_generate_and_optionally_import_ssh_key_pair():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="ssh-key-generate-toggle"' in html
+    assert 'id="ssh-key-generate-form"' in html
+    assert 'name="name" maxlength="100" placeholder="留空自动生成"' in html
+    assert 'name="file_name" maxlength="100"' in html
+    assert 'name="auto_import" type="checkbox" checked' in html
+    assert 'value="ed25519"' in html and 'value="rsa"' in html
+    assert "'/api/ssh-keys/generate'" in javascript
+
+
 def test_frontend_uses_themed_prompts_instead_of_browser_dialogs():
     html = Path("static/index.html").read_text(encoding="utf-8")
     javascript = Path("static/app.js").read_text(encoding="utf-8")
@@ -90,7 +103,7 @@ def test_browser_autofill_is_disabled_for_forms_and_credentials():
     assert all('autocomplete="off"' in form for form in forms)
     assert 'name="username" required autocomplete="off"' in html
     assert 'name="password" type="password" minlength="8" required autocomplete="new-password"' in html
-    assert html.count('name="passphrase" type="password" autocomplete="new-password"') == 2
+    assert html.count('name="passphrase" type="password" autocomplete="new-password"') == 3
     assert "input.autocomplete=type==='password'?'new-password':'off'" in javascript
 
 

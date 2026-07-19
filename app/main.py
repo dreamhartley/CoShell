@@ -30,9 +30,9 @@ from .backup import BackupError, MAX_BACKUP_BYTES, create_backup, parse_backup, 
 from .database import Database
 from .device_secrets import DeviceSecretError, protect as protect_device_secret, unprotect as unprotect_device_secret
 from .mcp import MCPError, call_tool as call_mcp_tool, list_tools as list_mcp_tools, search_tools
-from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
+from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
 from .searxng_backend import SearxNGService
-from .ssh import HostKeyRequired, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, detect_remote_os, file_info, parse_private_key, remove_recursive
+from .ssh import HostKeyRequired, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair
 from .vault import Vault, VaultError
 
 
@@ -264,6 +264,72 @@ def import_ssh_key(body: SSHKeyBody):
             raise HTTPException(409, "密钥名称已存在") from exc
         raise
     return public_ssh_key(db.fetchone("SELECT * FROM ssh_keys WHERE id=?", (cur.lastrowid,)))
+
+
+@app.post("/api/ssh-keys/generate")
+def generate_ssh_key(body: SSHKeyGenerateBody):
+    file_name = body.file_name.strip()
+    if not file_name:
+        key_directory = DATA / "ssh-keys"
+        prefix = f"id_{body.key_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        for _ in range(10):
+            candidate = f"{prefix}_{secrets.token_hex(2)}"
+            if not (key_directory / candidate).exists() and not (key_directory / f"{candidate}.pub").exists():
+                file_name = candidate
+                break
+        if not file_name:
+            raise HTTPException(409, "无法生成唯一的密钥文件名，请稍后重试")
+    requested_name = body.name.strip()
+    name = requested_name or file_name
+    if body.auto_import:
+        if not vault.unlocked:
+            raise HTTPException(423, "请先解锁密码库，再生成并自动导入密钥")
+        if db.fetchone("SELECT id FROM ssh_keys WHERE name=?", (name,)):
+            if requested_name:
+                raise HTTPException(409, "密钥名称已存在")
+            base_name = name
+            for index in range(2, 1001):
+                suffix = f" ({index})"
+                name = f"{base_name[:100 - len(suffix)]}{suffix}"
+                if not db.fetchone("SELECT id FROM ssh_keys WHERE name=?", (name,)):
+                    break
+            else:
+                raise HTTPException(409, "无法生成唯一的密钥名称，请手动填写")
+    try:
+        private_key, public_key = create_ssh_key_pair(body.key_type, body.rsa_bits, body.passphrase, name)
+        parsed = parse_private_key(private_key, body.passphrase)
+        fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(parsed.asbytes()).digest()).decode().rstrip("=")
+        private_path, public_path = save_ssh_key_pair(DATA / "ssh-keys", file_name, private_key, public_key)
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    imported = None
+    if body.auto_import:
+        try:
+            cur = db.execute(
+                "INSERT INTO ssh_keys(name,key_type,fingerprint,private_key_enc,passphrase_enc) VALUES(?,?,?,?,?)",
+                (name, parsed.get_name(), fingerprint, vault.encrypt(private_key), vault.encrypt(body.passphrase)),
+            )
+            imported = public_ssh_key(db.fetchone("SELECT * FROM ssh_keys WHERE id=?", (cur.lastrowid,)))
+        except Exception as exc:
+            private_path.unlink(missing_ok=True)
+            public_path.unlink(missing_ok=True)
+            if isinstance(exc, VaultError):
+                raise HTTPException(423, "密码库已锁定，无法自动导入密钥") from exc
+            if "UNIQUE" in str(exc):
+                raise HTTPException(409, "密钥名称已存在") from exc
+            raise
+    return {
+        "name": name,
+        "file_name": file_name,
+        "key_type": parsed.get_name(),
+        "fingerprint": fingerprint,
+        "private_key_path": str(private_path),
+        "public_key_path": str(public_path),
+        "imported": imported,
+    }
 
 
 @app.delete("/api/ssh-keys/{key_id}")

@@ -143,7 +143,17 @@
       <section id="settings-vault" class="settings-panel active">
         <div class="setting-summary"><div><strong>凭据保险库</strong><p id="settings-vault-status" class="muted"></p></div><span id="settings-vault-indicator" class="status-pill"></span></div>
         <p class="muted">服务器密码、私钥以及 Agent API 密钥均使用主密码派生的密钥加密保存。</p>
-        <div class="settings-section-title"><strong>SSH 私钥</strong><button id="ssh-key-import-toggle" type="button">导入密钥</button></div>
+        <div class="settings-section-title"><strong>SSH 私钥</strong><span class="settings-section-actions"><button id="ssh-key-generate-toggle" type="button" class="primary">生成密钥</button><button id="ssh-key-import-toggle" type="button">导入密钥</button></span></div>
+        <form id="ssh-key-generate-form" class="nested-form hidden" autocomplete="off">
+          <label>密钥名称<input name="name" maxlength="100" placeholder="留空自动生成"></label>
+          <label>保存文件名<input name="file_name" maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,99}" placeholder="留空自动生成，例如 id_ed25519"><small>密钥对保存到 data/ssh-keys；手动填写时只能使用字母、数字、点、下划线和连字符。</small></label>
+          <label>密钥类型<select name="key_type"><option value="ed25519">Ed25519（推荐）</option><option value="rsa">RSA</option></select></label>
+          <label id="ssh-key-rsa-bits" class="hidden">RSA 长度<select name="rsa_bits"><option value="3072">3072 位（推荐）</option><option value="4096">4096 位</option><option value="2048">2048 位</option></select></label>
+          <label>私钥口令（可选）<input name="passphrase" type="password" autocomplete="new-password"></label>
+          <label class="check"><input name="auto_import" type="checkbox" checked> 自动加密导入密码库</label>
+          <small>自动导入需要先解锁密码库；无论是否导入，私钥和公钥文件都会保存在 data 目录下。</small>
+          <div class="dialog-actions"><button type="button" id="ssh-key-generate-cancel">取消</button><button class="primary" type="submit">生成密钥对</button></div>
+        </form>
         <form id="ssh-key-import-form" class="nested-form hidden" autocomplete="off">
           <label>名称<input name="name" required maxlength="100" placeholder="例如：生产环境 Ed25519"></label>
           <label>选择私钥文件<input name="key_file" type="file" required></label>
