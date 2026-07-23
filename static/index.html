@@ -69,9 +69,13 @@
         </div>
         <form id="agent-chat-form" class="agent-composer" autocomplete="off">
           <div class="agent-input-shell">
+            <div id="agent-terminal-context-tag" class="agent-terminal-context-tag hidden">
+              <span id="agent-terminal-context-label"></span>
+              <button id="agent-terminal-context-remove" type="button" aria-label="取消插入终端内容" title="取消插入终端内容">×</button>
+            </div>
             <textarea id="agent-chat-input" rows="4" maxlength="20000" placeholder="Enter 发送，Shift+Enter 换行" aria-label="发送给 Agent 的消息" autocomplete="off"></textarea>
             <button id="agent-permission-mode" class="agent-permission-mode" type="button" aria-label="Agent 权限模式" aria-haspopup="dialog" aria-controls="agent-permission-confirm" aria-expanded="false" title="切换 Agent 权限模式">请求批准</button>
-            <button id="agent-attach-terminal" class="agent-attach-terminal" type="button" aria-label="附加终端内容到上下文" title="附加终端内容到上下文">&gt;_</button>
+            <button id="agent-attach-terminal" class="agent-attach-terminal" type="button" aria-label="附加终端内容到上下文" aria-pressed="false" title="附加终端内容到上下文">&gt;_</button>
             <button id="agent-chat-send" class="agent-send primary" type="submit" aria-label="发送" title="发送">↑</button>
           </div>
         </form>

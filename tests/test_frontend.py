@@ -398,6 +398,8 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert 'id="agent-chat-stop"' not in html
     assert 'id="agent-open-settings"' not in html
     assert 'id="agent-attach-terminal"' in html
+    assert 'id="agent-terminal-context-tag" class="agent-terminal-context-tag hidden"' in html
+    assert 'id="agent-terminal-context-remove"' in html
     assert 'id="agent-permission-mode"' in html
     assert 'id="agent-chat-hint"' not in html
     assert 'id="agent-approval-popover"' in html
@@ -409,6 +411,11 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert 'id="agent-permission-confirm-no"' in html
     assert "启用Agent完全访问模式" in html
     assert 'title="附加终端内容到上下文"' in html
+    assert "已插入终端内容 ${pendingContext.lineCount}行" in javascript
+    assert "tab.agentPendingContext=null;renderAgentChat();$('#agent-chat-input').focus()" in javascript
+    assert ".agent-input-shell.has-terminal-context textarea{padding-top:13px;text-indent:" in css
+    assert "tag.offsetWidth+7" in javascript
+    assert ".agent-terminal-context-tag{" in css
     assert 'placeholder="Enter 发送，Shift+Enter 换行"' in html
     assert "e.key==='Enter'&&!e.shiftKey" in javascript
     assert "const AGENT_WELCOME_PROMPTS=[" in javascript
