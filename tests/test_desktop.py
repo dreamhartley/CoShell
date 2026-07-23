@@ -56,6 +56,8 @@ def test_desktop_launcher_serves_app_and_stops(monkeypatch, tmp_path):
     assert captured["options"]["width"] == 1440
     assert captured["options"]["height"] == 900
     assert captured["options"]["min_size"] == (960, 640)
+    assert captured["options"]["js_api"].read_clipboard
+    assert captured["options"]["js_api"].write_clipboard
     assert captured["start_options"]["private_mode"] is False
     assert captured["start_options"]["icon"].endswith("assets\\app-icon.ico")
     from app.desktop import _load_window_size
@@ -69,6 +71,19 @@ def test_window_size_is_persisted(monkeypatch, tmp_path):
     _save_window_size(1680, 1050)
 
     assert _load_window_size() == (1680, 1050)
+
+
+def test_desktop_clipboard_api_serializes_native_access(monkeypatch):
+    import app.desktop as desktop
+
+    values = []
+    monkeypatch.setattr(desktop, "_read_windows_clipboard", lambda: "clipboard text")
+    monkeypatch.setattr(desktop, "_write_windows_clipboard", values.append)
+    api = desktop.DesktopApi()
+
+    assert api.read_clipboard() == "clipboard text"
+    assert api.write_clipboard("new text") is True
+    assert values == ["new text"]
 
 
 def test_physical_window_size_is_normalized_for_high_dpi():

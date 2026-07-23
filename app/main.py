@@ -78,9 +78,15 @@ def public_server(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def server_credentials(row: dict[str, Any]) -> dict[str, Any]:
+    if row.get("auth_type") != "private_key":
+        return {
+            "password": vault.decrypt(row.get("password_enc")),
+            "private_key": None,
+            "passphrase": None,
+        }
     key = db.fetchone("SELECT private_key_enc,passphrase_enc FROM ssh_keys WHERE id=?", (row.get("ssh_key_id"),)) if row.get("ssh_key_id") else None
     return {
-        "password": vault.decrypt(row.get("password_enc")),
+        "password": None,
         "private_key": vault.decrypt(key["private_key_enc"] if key else row.get("private_key_enc")),
         "passphrase": vault.decrypt(key["passphrase_enc"] if key else row.get("passphrase_enc")),
     }

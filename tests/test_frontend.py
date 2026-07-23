@@ -114,6 +114,64 @@ def test_server_deletion_offers_workspace_cleanup():
     assert "delete_workspace=${deleteWorkspace}" in javascript
 
 
+def test_server_editor_switches_authentication_fields():
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    source = javascript[
+        javascript.index("function updateServerEditorAuthFields"):
+        javascript.index("async function loadShortcuts")
+    ]
+
+    assert "form.elements.auth_type.addEventListener('change'" in source
+    assert "form.elements.ssh_key_id.addEventListener('change'" in source
+    assert "input.closest('label').classList.toggle('hidden',!visible)" in source
+    assert "input.disabled=!visible" in source
+    assert "ssh_key_id:usesKey&&d.ssh_key_id?Number(d.ssh_key_id):null" in source
+
+    context = quickjs.Context()
+    result = context.eval(
+        """
+        const fields={};
+        for(const name of ['password','ssh_key_id','private_key','passphrase']){
+          fields[name]={
+            value:'',
+            disabled:false,
+            hidden:false,
+            closest(){return {classList:{toggle(_name,value){fields[name].hidden=value}}}}
+          };
+        }
+        fields.auth_type={value:'private_key'};
+        const form={elements:fields};
+        """
+        + source.split("function editServer", 1)[0]
+        + """
+        updateServerEditorAuthFields(form);
+        const keyState=Object.fromEntries(
+          ['password','ssh_key_id','private_key','passphrase'].map(name=>[
+            name,{hidden:fields[name].hidden,disabled:fields[name].disabled}
+          ])
+        );
+        fields.auth_type.value='password';
+        updateServerEditorAuthFields(form);
+        const passwordState=Object.fromEntries(
+          ['password','ssh_key_id','private_key','passphrase'].map(name=>[
+            name,{hidden:fields[name].hidden,disabled:fields[name].disabled}
+          ])
+        );
+        JSON.stringify({keyState,passwordState});
+        """
+    )
+    assert result == (
+        '{"keyState":{"password":{"hidden":true,"disabled":true},'
+        '"ssh_key_id":{"hidden":false,"disabled":false},'
+        '"private_key":{"hidden":false,"disabled":false},'
+        '"passphrase":{"hidden":false,"disabled":false}},'
+        '"passwordState":{"password":{"hidden":false,"disabled":false},'
+        '"ssh_key_id":{"hidden":true,"disabled":true},'
+        '"private_key":{"hidden":true,"disabled":true},'
+        '"passphrase":{"hidden":true,"disabled":true}}}'
+    )
+
+
 def test_terminal_has_custom_context_menu_actions():
     javascript = Path("static/app.js").read_text(encoding="utf-8")
 
@@ -121,6 +179,38 @@ def test_terminal_has_custom_context_menu_actions():
     for label in ("复制", "粘贴", "Agent 命令", "全选终端内容", "清空终端显示", "断开连接", "重新连接"):
         assert f"label:'{label}'" in javascript
     assert "sendTerminalInput(tab,'/agent ')" in javascript
+
+
+def test_sftp_is_the_default_sidebar_panel():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+
+    assert 'class="side-tab active" data-panel="sftp"' in html
+    assert 'id="panel-sftp" class="side-panel active"' in html
+    assert 'class="side-tab side-tab-agent active"' not in html
+    assert 'id="panel-agent" class="side-panel agent-panel active"' not in html
+
+
+def test_terminal_clipboard_prefers_native_desktop_bridge():
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+
+    clipboard_source = javascript[
+        javascript.index("function desktopClipboard"):
+        javascript.index("async function disconnectTerminal")
+    ]
+    terminal_source = javascript[
+        javascript.index("function newTerminal"):
+        javascript.index("function activateTab")
+    ]
+    assert "window.pywebview?.api" in clipboard_source
+    assert "desktop.read_clipboard()" in clipboard_source
+    assert "desktop.write_clipboard(value)" in clipboard_source
+    assert "navigator.clipboard.readText()" in clipboard_source
+    assert "navigator.clipboard.writeText(value)" in clipboard_source
+    assert "term.attachCustomKeyEventHandler" in terminal_source
+    assert "key==='c'&&term.hasSelection()" in terminal_source
+    assert "key==='v'" in terminal_source
+    assert "term.paste(text)" in terminal_source
+    assert javascript.count("navigator.clipboard") == 2
 
 
 def test_shortcuts_use_compact_rows_context_menu_and_code_editor():
@@ -232,8 +322,8 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     css = Path("static/app.css").read_text(encoding="utf-8")
 
     assert 'data-panel="agent"' in html
-    assert 'class="side-tab side-tab-agent active"' in html
-    assert 'class="side-tab active" data-panel="sftp"' not in html
+    assert 'class="side-tab side-tab-agent active"' not in html
+    assert 'class="side-tab active" data-panel="sftp"' in html
     assert 'class="side-tab-agent-icon"' in html
     assert '<button class="side-tab" data-panel="agent">Agent</button>' not in html
     assert ".side-tab-agent{display:grid;width:36px" in css
@@ -241,8 +331,8 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert ".side-tab-agent:hover{color:var(--accent)}" in css
     assert Path("static/icons/ai-hub.svg").is_file()
     assert 'id="agent-chat-form"' in html
-    assert 'id="panel-agent" class="side-panel agent-panel active"' in html
-    assert 'id="panel-sftp" class="side-panel active"' not in html
+    assert 'id="panel-agent" class="side-panel agent-panel active"' not in html
+    assert 'id="panel-sftp" class="side-panel active"' in html
     assert 'id="agent-new-chat"' in html
     assert 'id="agent-chat-stop"' not in html
     assert 'id="agent-open-settings"' not in html

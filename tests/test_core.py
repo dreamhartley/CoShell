@@ -159,6 +159,35 @@ def test_generate_ssh_key_saves_under_data_and_auto_imports(monkeypatch, tmp_pat
     database.close()
 
 
+def test_saved_server_credentials_follow_selected_auth_type(monkeypatch, tmp_path):
+    database = Database(tmp_path / "webssh.db")
+    test_vault = Vault(database)
+    test_vault.initialize("test master password")
+    monkeypatch.setattr(main_app, "db", database)
+    monkeypatch.setattr(main_app, "vault", test_vault)
+    row = {
+        "ssh_key_id": None,
+        "password_enc": test_vault.encrypt("server password"),
+        "private_key_enc": test_vault.encrypt("private key data"),
+        "passphrase_enc": test_vault.encrypt("key passphrase"),
+    }
+
+    password_credentials = main_app.server_credentials({**row, "auth_type": "password"})
+    assert password_credentials == {
+        "password": "server password",
+        "private_key": None,
+        "passphrase": None,
+    }
+
+    key_credentials = main_app.server_credentials({**row, "auth_type": "private_key"})
+    assert key_credentials == {
+        "password": None,
+        "private_key": "private key data",
+        "passphrase": "key passphrase",
+    }
+    database.close()
+
+
 @pytest.mark.parametrize(("raw", "expected"), [
     ("/home/user/../data", "/home/data"),
     ("./logs//today", "logs/today"),

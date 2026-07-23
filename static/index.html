@@ -33,11 +33,11 @@
         </div>
       </section>
       <nav class="side-tabs" aria-label="工具">
-        <button class="side-tab side-tab-agent active" data-panel="agent" aria-label="Agent" title="Agent"><span class="side-tab-agent-icon" aria-hidden="true"></span></button>
-        <button class="side-tab" data-panel="sftp">文件</button>
+        <button class="side-tab side-tab-agent" data-panel="agent" aria-label="Agent" title="Agent"><span class="side-tab-agent-icon" aria-hidden="true"></span></button>
+        <button class="side-tab active" data-panel="sftp">文件</button>
         <button class="side-tab" data-panel="shortcuts">指令</button>
       </nav>
-      <section id="panel-agent" class="side-panel agent-panel active">
+      <section id="panel-agent" class="side-panel agent-panel">
         <div class="agent-panel-head">
           <div class="agent-panel-title"><strong>Agent</strong><span id="agent-session-label">未连接终端</span></div>
           <div class="agent-panel-actions">
@@ -76,7 +76,7 @@
           </div>
         </form>
       </section>
-      <section id="panel-sftp" class="side-panel">
+      <section id="panel-sftp" class="side-panel active">
         <div class="panel-head"><strong>SFTP</strong><button id="sftp-refresh" class="icon-btn" title="刷新">↻</button></div>
         <div class="path-row"><button id="sftp-up" class="icon-btn">↑</button><input id="sftp-path" value="." aria-label="远程路径" autocomplete="off"><button id="sftp-go" class="soft-btn">前往</button></div>
         <div class="file-actions"><button id="upload-btn">上传</button><button id="new-file-btn">新建文件</button><button id="mkdir-btn">新建目录</button><button id="batch-btn" class="hidden">批量操作</button><input id="upload-input" type="file" multiple hidden></div>

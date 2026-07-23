@@ -429,6 +429,13 @@ function newTerminal(tabData={}){
   term.writeln('\x1b[38;5;111mCoShell\x1b[0m — 点击连接开始会话\r\n');
   // xterm.js owns key-to-sequence conversion so application cursor/keypad modes
   // selected by ncurses programs are preserved and each key is emitted once.
+  term.attachCustomKeyEventHandler(event=>{
+    if(event.type!=='keydown'||!event.ctrlKey||event.altKey||event.metaKey)return true;
+    const key=event.key.toLowerCase();
+    if(key==='c'&&term.hasSelection()){writeClipboard(term.getSelection()).then(()=>toast('已复制终端内容')).catch(err=>toast(err.message,true));return false}
+    if(key==='v'){readClipboard().then(text=>{if(text)term.paste(text)}).catch(err=>toast(err.message,true));return false}
+    return true;
+  });
   term.onData(data=>sendTerminalInput(tab,data));
   term.onResize(({cols,rows})=>{syncTerminalSize(tab,cols,rows);if(tab.agentAutocompleteOpen)positionTerminalAgentAutocomplete(tab)});
   host.addEventListener('pointerdown',event=>{if(tab.agentAutocompleteOpen&&!tab.agentAutocomplete.contains(event.target))hideTerminalAgentAutocomplete(tab)});
@@ -554,16 +561,41 @@ function setMetric(name,percent,value,detail){percent=Math.max(0,Math.min(100,Nu
 function resetSystemInfo(){$('#system-ip').textContent='--';$('#copy-system-ip').disabled=true;$('#system-uptime').textContent='--';$('#system-load').textContent='--, --, --';setMetric('cpu',0,'--');setMetric('memory',0,'--','--/--');setMetric('swap',0,'--','--/--')}
 let systemInfoRequest=0;
 async function loadSystemInfo(){const tab=activeTab(),request=++systemInfoRequest;if(!tab?.sessionId)return resetSystemInfo();try{const data=await api(`/api/system-info?session_id=${encodeURIComponent(tab.sessionId)}`);if(request!==systemInfoRequest||tab!==activeTab())return;$('#system-ip').textContent=data.ip;$('#copy-system-ip').disabled=false;$('#system-uptime').textContent=formatUptime(data.uptime);$('#system-load').textContent=data.load.join(', ');const memoryPercent=data.memory_total?data.memory_used*100/data.memory_total:0,swapPercent=data.swap_total?data.swap_used*100/data.swap_total:0;setMetric('cpu',data.cpu_percent,`${Math.round(data.cpu_percent)}%`);setMetric('memory',memoryPercent,`${Math.round(memoryPercent)}%`,`${formatBytes(data.memory_used)}/${formatBytes(data.memory_total)}`);setMetric('swap',swapPercent,`${Math.round(swapPercent)}%`,`${formatBytes(data.swap_used)}/${formatBytes(data.swap_total)}`)}catch(err){if(request!==systemInfoRequest)return;resetSystemInfo();if((err.status===404||err.status===410)&&tab.sessionId)markTabDisconnected(tab)}}
-$('#copy-system-ip').onclick=async()=>{const ip=$('#system-ip').textContent;if(ip==='--')return;try{await navigator.clipboard.writeText(ip);toast('IP 已复制')}catch{toast('复制失败',true)}};
+$('#copy-system-ip').onclick=async()=>{const ip=$('#system-ip').textContent;if(ip==='--')return;try{await writeClipboard(ip);toast('IP 已复制')}catch{toast('复制失败',true)}};
 $('#system-info-toggle').onclick=()=>{const collapsed=$('#system-info').classList.toggle('collapsed');$('#system-info-toggle').setAttribute('aria-expanded',String(!collapsed))};
 setInterval(()=>{if(!document.hidden)loadSystemInfo()},5000);
 
 async function loadServers(){state.servers=await api('/api/servers');renderHostManager()}
 async function openServerWorkspace(server){try{await api(`/api/servers/${server.id}/workspace/open`,{method:'POST'});toast('已在资源管理器中打开 workspace')}catch(err){toast(err.message||'打开 workspace 失败',true)}}
 async function deleteServer(server){if(!await themedConfirm(`删除主机“${server.name}”？`,{title:'删除主机',confirmText:'删除',danger:true}))return;const deleteWorkspace=await themedConfirm(`是否同时删除“${server.name}”对应 workspace 中的所有文件？\n\n选择“取消”将保留这些文件。`);await api(`/api/servers/${server.id}?delete_workspace=${deleteWorkspace}`,{method:'DELETE'});await loadServers();toast(deleteWorkspace?'主机和 workspace 已删除':'主机已删除，workspace 已保留')}
-function editServer(s){openEditor('编辑主机',[
+function updateServerEditorAuthFields(form=$('#editor-form')){
+  const usesKey=form.elements.auth_type.value==='private_key',usesSavedKey=!!form.elements.ssh_key_id.value;
+  for(const [name,visible] of [['password',!usesKey],['ssh_key_id',usesKey],['private_key',usesKey&&!usesSavedKey],['passphrase',usesKey&&!usesSavedKey]]){
+    const input=form.elements[name];
+    input.closest('label').classList.toggle('hidden',!visible);
+    input.disabled=!visible;
+  }
+}
+function editServer(s){
+  openEditor('编辑主机',[
   ['name','名称',s.name],['host','主机',s.host],['port','端口',s.port,'number'],['username','用户名',s.username],['auth_type','认证方式',s.auth_type,'select'],['ssh_key_id','密码库密钥',s.ssh_key_id||'','sshkey'],['password','新密码（留空保持不变）','', 'password'],['private_key','新私钥（留空保持不变）','','textarea'],['passphrase','新私钥口令（留空保持不变）','','password'],['note','备注',s.note,'textarea']
-],async d=>{await api(`/api/servers/${s.id}`,{method:'PUT',body:JSON.stringify({...d,port:Number(d.port),ssh_key_id:d.ssh_key_id?Number(d.ssh_key_id):null,password:d.password||null,private_key:d.private_key||null,passphrase:d.passphrase||null})});loadServers()})}
+  ],async d=>{
+    const usesKey=d.auth_type==='private_key';
+    await api(`/api/servers/${s.id}`,{method:'PUT',body:JSON.stringify({
+      ...d,
+      port:Number(d.port),
+      ssh_key_id:usesKey&&d.ssh_key_id?Number(d.ssh_key_id):null,
+      password:!usesKey&&d.password?d.password:null,
+      private_key:usesKey&&d.private_key?d.private_key:null,
+      passphrase:usesKey&&d.passphrase?d.passphrase:null,
+    })});
+    loadServers();
+  });
+  const form=$('#editor-form');
+  form.elements.auth_type.addEventListener('change',()=>updateServerEditorAuthFields(form));
+  form.elements.ssh_key_id.addEventListener('change',()=>updateServerEditorAuthFields(form));
+  updateServerEditorAuthFields(form);
+}
 
 async function loadShortcuts(){state.shortcuts=await api('/api/shortcuts');renderShortcuts()}
 function shortcutActions(s){return [
@@ -593,8 +625,17 @@ async function fileAction(item){const action=await themedInput(`操作 ${item.na
 function chosenItems(item){return state.selectedFiles.has(item)&&state.selectedFiles.size?[...state.selectedFiles]:[item]}
 function closeContextMenu(){$('.context-menu')?.remove()}
 function showContextMenu(event,actions){event.preventDefault();closeContextMenu();const menu=document.createElement('div');menu.className='context-menu';for(const action of actions){if(action===null){menu.append(document.createElement('hr'));continue}const button=document.createElement('button');button.textContent=action.label;button.disabled=!!action.disabled;button.onclick=async()=>{closeContextMenu();try{await action.run()}catch(err){toast(err.message,true)}};menu.append(button)}document.body.append(menu);const left=Math.min(event.clientX,innerWidth-menu.offsetWidth-8),top=Math.min(event.clientY,innerHeight-menu.offsetHeight-8);menu.style.left=`${Math.max(8,left)}px`;menu.style.top=`${Math.max(8,top)}px`}
-async function readClipboard(){try{return await navigator.clipboard.readText()}catch{return await themedInput('浏览器无法直接读取剪贴板，请在下方粘贴内容。','',{title:'粘贴到终端',label:'粘贴内容'})}}
-async function writeClipboard(value){try{await navigator.clipboard.writeText(value)}catch{const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.select();document.execCommand('copy');area.remove()}}
+function desktopClipboard(){return window.pywebview?.api}
+async function readClipboard(){
+  const desktop=desktopClipboard();
+  if(desktop?.read_clipboard)try{return await desktop.read_clipboard()}catch{}
+  try{return await navigator.clipboard.readText()}catch{return await themedInput('浏览器无法直接读取剪贴板，请在下方粘贴内容。','',{title:'粘贴到终端',label:'粘贴内容'})}
+}
+async function writeClipboard(value){
+  const desktop=desktopClipboard();
+  if(desktop?.write_clipboard)try{await desktop.write_clipboard(value);return}catch{}
+  try{await navigator.clipboard.writeText(value)}catch{const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.select();document.execCommand('copy');area.remove()}
+}
 async function disconnectTerminal(tab){if(!await themedConfirm(`断开 ${tab.title} 的 SSH 连接？`,{title:'断开连接',confirmText:'断开',danger:true}))return;if(tab.ws?.readyState===WebSocket.OPEN)tab.ws.send(JSON.stringify({type:'close'}));tab.ws?.close()}
 function showTerminalMenu(event,tab){const connected=tab.status==='connected',hasSelection=tab.term.hasSelection();showContextMenu(event,[
   {label:'复制',disabled:!hasSelection,run:async()=>{await writeClipboard(tab.term.getSelection());toast('已复制终端内容')}},
@@ -618,7 +659,7 @@ function showFileMenu(event,item){const tab=activeTab(),items=chosenItems(item),
   {label:'复制文件路径',disabled:items.length!==1,run:()=>copyText(paths[0])}
 ])}
 async function pasteRemote(destination){const tab=activeTab(),clip=state.remoteClipboard;if(!clip)return;if(clip.sessionId!==tab.sessionId)throw new Error('当前版本仅支持在同一个 SSH 会话内粘贴');for(const item of clip.items){const target=joinRemote(destination,item.name);try{await api('/api/sftp/copy',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,source:item.path,destination:target,overwrite:false})})}catch(err){if(!err.message.includes('存在')||!await themedConfirm(`${item.name} 已存在，是否覆盖？`))throw err;await api('/api/sftp/copy',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,source:item.path,destination:target,overwrite:true})})}}toast('粘贴完成');loadSftp()}
-async function copyText(value){try{await navigator.clipboard.writeText(value)}catch{const area=document.createElement('textarea');area.value=value;document.body.append(area);area.select();document.execCommand('copy');area.remove()}toast('路径已复制')}
+async function copyText(value){await writeClipboard(value);toast('路径已复制')}
 function editorMode(name){const ext=(name.split('.').pop()||'').toLowerCase(),map={py:'python',js:'javascript',mjs:'javascript',cjs:'javascript',json:{name:'javascript',json:true},ts:'javascript',tsx:'javascript',html:'htmlmixed',htm:'htmlmixed',css:'css',scss:'text/x-scss',xml:'xml',svg:'xml',sh:'shell',bash:'shell',zsh:'shell',yaml:'yaml',yml:'yaml',md:'markdown',markdown:'markdown',c:'text/x-csrc',h:'text/x-csrc',cpp:'text/x-c++src',cc:'text/x-c++src',hpp:'text/x-c++src',java:'text/x-java',cs:'text/x-csharp'};return map[ext]||null}
 function editorModeLabel(name){const mode=editorMode(name);return typeof mode==='string'?mode:(mode?.json?'JSON':'纯文本')}
 function ensureEditor(){if(state.editor.cm)return state.editor.cm;const cm=CodeMirror.fromTextArea($('#file-editor-textarea'),{lineNumbers:true,indentUnit:2,tabSize:2,indentWithTabs:false,smartIndent:true,matchBrackets:true,autoCloseBrackets:true,styleActiveLine:true,lineWrapping:false,theme:themeModes[currentTheme()]==='dark'?'material-darker':'default',extraKeys:{'Ctrl-S':()=>saveFileEditor(),'Cmd-S':()=>saveFileEditor(),Tab:editor=>editor.somethingSelected()?editor.indentSelection('add'):editor.execCommand('insertSoftTab'),'Shift-Tab':editor=>editor.indentSelection('subtract')}});cm.on('change',()=>{if(!state.editor.loading){state.editor.dirty=true;updateEditorState()}});cm.on('cursorActivity',()=>{const pos=cm.getCursor();$('#file-editor-position').textContent=`Ln ${pos.line+1}, Col ${pos.ch+1}`});state.editor.cm=cm;return cm}
