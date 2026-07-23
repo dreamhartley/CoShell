@@ -20,6 +20,7 @@ class FakeWindow:
     def __init__(self):
         self.width = 1440
         self.height = 900
+        self.confirm_close = False
         self.native = type("Native", (), {"scale_factor": 2})()
         self.events = type("Events", (), {"closing": FakeEvent()})()
 
@@ -32,6 +33,7 @@ def test_desktop_launcher_serves_app_and_stops(monkeypatch, tmp_path):
 
     def create_window(title, url, **kwargs):
         captured.update(title=title, url=url, options=kwargs)
+        fake_window.confirm_close = kwargs["confirm_close"]
         return fake_window
 
     def start(**kwargs):
@@ -39,9 +41,13 @@ def test_desktop_launcher_serves_app_and_stops(monkeypatch, tmp_path):
             assert response.status == 200
             assert b"vault_initialized" in response.read()
         captured["start_options"] = kwargs
+        fake_window.events.closing.fire()
+        assert fake_window.confirm_close is False
         fake_window.width = 2560
         fake_window.height = 1520
+        captured["options"]["js_api"].set_active_connections(1)
         fake_window.events.closing.fire()
+        assert fake_window.confirm_close is True
 
     monkeypatch.setattr(webview, "create_window", create_window)
     monkeypatch.setattr(webview, "start", start)
@@ -58,6 +64,8 @@ def test_desktop_launcher_serves_app_and_stops(monkeypatch, tmp_path):
     assert captured["options"]["min_size"] == (960, 640)
     assert captured["options"]["js_api"].read_clipboard
     assert captured["options"]["js_api"].write_clipboard
+    assert captured["options"]["js_api"].has_active_connections()
+    assert captured["options"]["localization"]["global.quitConfirmation"] == "仍有主机保持连接，确定退出吗？"
     assert captured["start_options"]["private_mode"] is False
     assert captured["start_options"]["icon"].endswith("assets\\app-icon.ico")
     from app.desktop import _load_window_size
@@ -84,6 +92,18 @@ def test_desktop_clipboard_api_serializes_native_access(monkeypatch):
     assert api.read_clipboard() == "clipboard text"
     assert api.write_clipboard("new text") is True
     assert values == ["new text"]
+
+
+def test_desktop_api_tracks_active_connections():
+    from app.desktop import DesktopApi
+
+    api = DesktopApi()
+
+    assert api.has_active_connections() is False
+    assert api.set_active_connections(2) is True
+    assert api.has_active_connections() is True
+    assert api.set_active_connections(0) is True
+    assert api.has_active_connections() is False
 
 
 def test_physical_window_size_is_normalized_for_high_dpi():

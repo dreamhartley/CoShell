@@ -213,6 +213,14 @@ def test_terminal_clipboard_prefers_native_desktop_bridge():
     assert javascript.count("navigator.clipboard") == 2
 
 
+def test_connected_host_count_is_synced_to_desktop_close_guard():
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    update_count = javascript.split("function updateCount()", 1)[1].split("\n", 1)[0]
+
+    assert "t.status==='connected'" in update_count
+    assert "desktop.set_active_connections(n)" in update_count
+
+
 def test_shortcuts_use_compact_rows_context_menu_and_code_editor():
     html = Path("static/index.html").read_text(encoding="utf-8")
     javascript = Path("static/app.js").read_text(encoding="utf-8")
@@ -441,9 +449,17 @@ def test_terminal_agent_is_an_isolated_contextual_quick_fix():
     assert "agent-command" in css
     assert "text-overflow:ellipsis" in css
     assert ".agent-message,.agent-activity{flex-shrink:0}" in css
-    assert "-webkit-user-select:text;user-select:text" in css
-    assert "复制选中内容" in javascript
-    assert "复制整条消息" in javascript
+    assert ".agent-markdown,.agent-markdown *{-webkit-user-select:text;user-select:text;cursor:auto}" in css
+    assert ".agent-chat,.agent-message{cursor:default}" in css
+    assert "if(entry.role==='assistant')el.append(createAgentMessageCopyButton(entry.text))" in javascript
+    assert "className='agent-message-copy'" in javascript
+    assert ".agent-message-copy{display:grid;width:22px;height:22px;margin:3px auto 0 0" in css
+    assert 'mask:url("/static/icons/copy.svg")' in css
+    assert Path("static/icons/copy.svg").is_file()
+    assert "button.setAttribute('aria-label','复制此消息')" in javascript
+    assert "$('#agent-chat').addEventListener('contextmenu'" not in javascript
+    assert "复制选中内容" not in javascript
+    assert "复制整条消息" not in javascript
     assert "function renderAgentProcess" in javascript
     assert "agent-process-toggle" in css
     assert "process?.items.push(tab.agentActivity)" in javascript

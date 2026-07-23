@@ -118,6 +118,8 @@ class DesktopApi:
 
     def __init__(self) -> None:
         self._clipboard_lock = threading.RLock()
+        self._connection_lock = threading.RLock()
+        self._active_connections = 0
 
     def read_clipboard(self) -> str:
         with self._clipboard_lock:
@@ -127,6 +129,15 @@ class DesktopApi:
         with self._clipboard_lock:
             _write_windows_clipboard(value)
         return True
+
+    def set_active_connections(self, count: int) -> bool:
+        with self._connection_lock:
+            self._active_connections = max(0, int(count))
+        return True
+
+    def has_active_connections(self) -> bool:
+        with self._connection_lock:
+            return self._active_connections > 0
 
 
 def _data_dir() -> Path:
@@ -241,20 +252,26 @@ def run_desktop() -> None:
 
     try:
         width, height = _load_window_size()
+        desktop_api = DesktopApi()
         window = webview.create_window(
             "CoShell",
             f"http://127.0.0.1:{port}",
-            js_api=DesktopApi(),
+            js_api=desktop_api,
             width=width,
             height=height,
             min_size=MIN_WINDOW_SIZE,
             confirm_close=False,
+            localization={"global.quitConfirmation": "仍有主机保持连接，确定退出吗？"},
         )
         if window is not None and hasattr(window, "events"):
             # WinForms reports physical pixels while create_window expects
             # logical pixels. Persist the normalized final dimensions from the
             # locking closing event so resize worker threads cannot race.
-            window.events.closing += lambda: _save_window_size(*_logical_window_size(window))
+            def prepare_window_close() -> None:
+                window.confirm_close = desktop_api.has_active_connections()
+                _save_window_size(*_logical_window_size(window))
+
+            window.events.closing += prepare_window_close
         webview.start(
             private_mode=False,
             storage_path=str(_data_dir() / "webview"),

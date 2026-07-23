@@ -261,11 +261,16 @@ function startAgentWelcomeTypewriter(){
   const tick=()=>{if(!target.isConnected){agentWelcomeTypewriterTimer=null;return}const prompt=AGENT_WELCOME_PROMPTS[agentWelcomePromptIndex];length+=deleting?-1:1;target.textContent=prompt.slice(0,length);let delay=deleting?45:90;if(!deleting&&length===prompt.length){deleting=true;delay=1800}else if(deleting&&length===0){deleting=false;agentWelcomePromptIndex=(agentWelcomePromptIndex+1)%AGENT_WELCOME_PROMPTS.length;delay=320}agentWelcomeTypewriterTimer=setTimeout(tick,delay)};
   tick()
 }
+function createAgentMessageCopyButton(text){
+  const button=document.createElement('button');button.type='button';button.className='agent-message-copy';button.title='复制此消息';button.setAttribute('aria-label','复制此消息');
+  button.onclick=async()=>{try{await writeClipboard(text);toast('聊天内容已复制')}catch(err){toast(err.message||'复制失败',true)}};
+  return button
+}
 function renderAgentChat(){
   const tab=activeTab(),root=$('#agent-chat'),input=$('#agent-chat-input'),send=$('#agent-chat-send');stopAgentWelcomeTypewriter();root.replaceChildren();
   $('#agent-session-label').textContent=tab?`${tab.title} · ${tab.status==='connected'?'已连接':'未连接'}`:'未连接终端';
   if(!tab||!tab.agentChat.length){root.innerHTML='<div class="agent-welcome"><span>✦</span><strong>SSH Agent</strong><p class="agent-welcome-prompt" aria-hidden="true"><span id="agent-welcome-prompt"></span></p></div>';startAgentWelcomeTypewriter()}
-  else for(const entry of tab.agentChat){if(entry.kind==='process'){root.append(renderAgentProcess(entry));continue}const el=document.createElement('div');el.className=`agent-message ${entry.role}${entry.error?' error':''}`;el.append(renderAgentChatMarkdown(entry.text));root.append(el)}
+  else for(const entry of tab.agentChat){if(entry.kind==='process'){root.append(renderAgentProcess(entry));continue}const el=document.createElement('div');el.className=`agent-message ${entry.role}${entry.error?' error':''}`;el.append(renderAgentChatMarkdown(entry.text));if(entry.role==='assistant')el.append(createAgentMessageCopyButton(entry.text));root.append(el)}
   const disconnected=!tab||tab.status!=='connected',busy=!!tab?.agentBusy;input.disabled=disconnected||busy;send.disabled=disconnected;send.classList.toggle('primary',!busy);send.classList.toggle('stop',busy);send.textContent=busy?'■':'↑';send.setAttribute('aria-label',busy?'停止当前任务':'发送');send.title=busy?'停止当前任务':'发送';renderAgentApproval(tab);renderAgentPermissionMode(tab);root.scrollTop=root.scrollHeight
 }
 function localAgentToolAction(event){if(event.tool==='workspace_list')return '列出本地目录';if(event.tool==='workspace_read')return '读取本地文件';if(event.tool==='workspace_write')return '写入本地文件';if(event.tool==='sftp_transfer')return event.direction==='download'?'下载文件':'上传文件';if(event.tool==='workspace_root_list')return '列出共享根目录';if(event.tool==='workspace_root_read')return '读取共享文件';if(event.tool==='workspace_root_write')return '写入共享文件';if(event.tool==='workspace_root_sftp_transfer')return event.direction==='download'?'下载到共享根目录':'从共享根目录上传';return '访问本地 workspace'}
@@ -305,15 +310,6 @@ $('#agent-permission-confirm-no').onclick=()=>answerAgentPermissionMode(false);
 $('#agent-permission-mode').onclick=()=>{const tab=activeTab();if(tab?.agentBusy)return;const full=state.sidebarAgentPermissionMode==='full_access';if(full){state.sidebarAgentPermissionMode='request_approval';state.sidebarAgentPermissionPrompt=false;sessionStorage.setItem('coshell-sidebar-agent-permission-mode',state.sidebarAgentPermissionMode);renderAgentChat();return}state.sidebarAgentPermissionPrompt=!state.sidebarAgentPermissionPrompt;renderAgentChat();if(state.sidebarAgentPermissionPrompt)$('#agent-permission-confirm-no').focus()};
 $('#agent-new-chat').onclick=async()=>{const tab=activeTab();if(!tab||tab.agentBusy)return;if(tab.sessionId)try{await api('/api/agent/chat/reset',{method:'POST',body:JSON.stringify({session_id:tab.sessionId})})}catch(err){return toast(err.message,true)}tab.agentChat=[];tab.agentPendingContext=null;renderAgentChat();toast('已新建 Agent 对话')};
 $('#agent-attach-terminal').onclick=()=>{const tab=activeTab();if(!tab?.sessionId)return toast('请先连接并选择一个终端',true);tab.agentPendingContext=recentTerminalContext(tab);renderAgentChat();toast(`已附加${tab.agentPendingContext.source==='selection'?'选中内容':'终端内容'} ${tab.agentPendingContext.lineCount} 行到上下文`)};
-$('#agent-chat').addEventListener('contextmenu',event=>{
-  const root=$('#agent-chat'),selection=window.getSelection(),insideSelection=selection&&!selection.isCollapsed&&root.contains(selection.anchorNode)&&root.contains(selection.focusNode),selected=insideSelection?selection.toString():'';
-  const message=event.target.closest('.agent-message'),messageText=message?.innerText?.trim()||'';
-  if(!selected&&!messageText)return;
-  showContextMenu(event,[
-    {label:selected?'复制选中内容':'复制此消息',run:async()=>{await writeClipboard(selected||messageText);toast('聊天内容已复制')}},
-    ...(selected&&messageText&&selected.trim()!==messageText?[{label:'复制整条消息',run:async()=>{await writeClipboard(messageText);toast('整条消息已复制')}}]:[]),
-  ])
-});
 function handleAgentTerminalInput(tab,data){
   if(tab.quickAgentBusy){if(tab.quickAgentApproval)return handleTerminalAgentApprovalInput(tab,data);if(data.includes('\x03')){tab.quickAgentAbort?.abort();return}if(!tab.agentBusyNotice){tab.term.writeln('\r\n\x1b[33m终端 Agent 正在处置，按 Ctrl+C 停止…\x1b[0m');tab.agentBusyNotice=true}return}
   tab.agentBusyNotice=false;
@@ -467,7 +463,7 @@ async function closeTab(tab){
   if(tab.ws?.readyState===WebSocket.OPEN){tab.ws.send(JSON.stringify({type:'close'}));tab.ws.close()}
   tab.term.dispose();tab.host.remove();const i=state.tabs.indexOf(tab);state.tabs.splice(i,1);if(state.activeId===tab.id)state.activeId=state.tabs[Math.max(0,i-1)]?.id||null;renderTabs();activateTab(state.activeId);saveTabs();
 }
-function updateCount(){const n=state.tabs.filter(t=>t.status==='connected').length;$('#connection-count').textContent=`${n} 个连接`}
+function updateCount(){const n=state.tabs.filter(t=>t.status==='connected').length;$('#connection-count').textContent=`${n} 个连接`;const desktop=window.pywebview?.api;if(desktop?.set_active_connections)Promise.resolve(desktop.set_active_connections(n)).catch(()=>{})}
 let saveTimer;function saveTabs(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>api('/api/tabs',{method:'PUT',body:JSON.stringify(state.tabs.map((t,i)=>({id:t.id,title:t.title,server_id:t.server_id,position:i,last_path:t.last_path||'.'})))}).catch(()=>{}),250)}
 
 function openConnect(prefill={},reuseTab=null){
