@@ -283,6 +283,15 @@ def test_host_library_replaces_sidebar_server_panel_and_supports_card_actions():
     assert ".host-icon" in css
 
 
+def test_changed_host_key_dialog_allows_explicit_retrust():
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert "信任新指纹并连接" in javascript
+    assert "请先通过可信渠道核对新指纹" in javascript
+    assert "$('#host-key-accept').classList.remove('hidden')" in javascript
+    assert "为保护连接，本次无法继续" not in javascript
+
+
 def test_local_terminal_prompt_is_single_and_pinned_to_bottom():
     javascript = Path("static/app.js").read_text(encoding="utf-8")
 

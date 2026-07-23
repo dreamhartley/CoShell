@@ -192,6 +192,16 @@ def update_server(server_id: int, body: ServerBody):
     old = db.fetchone("SELECT * FROM servers WHERE id=?", (server_id,))
     if not old:
         raise HTTPException(404, "服务器不存在")
+    connection_info_changed = (
+        old["host"].strip() != body.host.strip()
+        or int(old["port"]) != body.port
+        or old["username"].strip() != body.username.strip()
+        or old["auth_type"] != body.auth_type
+        or old.get("ssh_key_id") != body.ssh_key_id
+        or body.password is not None
+        or body.private_key is not None
+        or body.passphrase is not None
+    )
     ensure_ssh_key(body.ssh_key_id)
     try:
         password = vault.encrypt(body.password) if body.password is not None else old["password_enc"]
@@ -199,8 +209,9 @@ def update_server(server_id: int, body: ServerBody):
         passphrase = vault.encrypt(body.passphrase) if body.passphrase is not None else old["passphrase_enc"]
     except VaultError as exc:
         raise HTTPException(423, str(exc)) from exc
-    db.execute("UPDATE servers SET name=?,host=?,port=?,username=?,auth_type=?,password_enc=?,private_key_enc=?,passphrase_enc=?,ssh_key_id=?,note=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-               (body.name, body.host, body.port, body.username, body.auth_type, password, private_key, passphrase, body.ssh_key_id, body.note, server_id))
+    db.execute("UPDATE servers SET name=?,host=?,port=?,username=?,auth_type=?,password_enc=?,private_key_enc=?,passphrase_enc=?,ssh_key_id=?,note=?,os_type=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+               (body.name, body.host, body.port, body.username, body.auth_type, password, private_key, passphrase, body.ssh_key_id, body.note,
+                "default" if connection_info_changed else old.get("os_type", "default"), server_id))
     return public_server(db.fetchone("SELECT * FROM servers WHERE id=?", (server_id,)))
 
 
@@ -1218,6 +1229,7 @@ async def terminal_socket(ws: WebSocket):
         return
     await ws.accept()
     session = None
+    host_identity_changed = False
     try:
         first = await ws.receive_json()
         if first.get("type") != "connect":
@@ -1241,16 +1253,17 @@ async def terminal_socket(ws: WebSocket):
                         break
                     if answer.get("type") == "close":
                         raise WebSocketDisconnect()
-                if answer.get("type") != "trust_host" or not answer.get("accept") or required.changed:
-                    raise ValueError("主机指纹未被信任" if not required.changed else "主机指纹发生变化，连接已阻止")
+                if answer.get("type") != "trust_host" or not answer.get("accept"):
+                    raise ValueError("主机指纹未被信任")
                 db.execute("INSERT OR REPLACE INTO host_keys(host,port,algorithm,fingerprint,key_base64,trusted_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)",
                            (required.host, required.port, required.key.get_name(), required.fingerprint, required.key.get_base64()))
+                host_identity_changed = host_identity_changed or required.changed
                 data["trusted_host_key"] = required.key
         if first.get("server_id") is not None:
             server_id = int(first["server_id"])
             saved_server = db.fetchone("SELECT os_type FROM servers WHERE id=?", (server_id,))
             os_type = saved_server.get("os_type", "default") if saved_server else "default"
-            if os_type == "default":
+            if os_type == "default" or host_identity_changed:
                 try:
                     os_type = await asyncio.to_thread(detect_remote_os, session)
                 except (OSError, EOFError, AttributeError, paramiko.SSHException):

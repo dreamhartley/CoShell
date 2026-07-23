@@ -25,7 +25,8 @@ function showHostKeyDialog(ws,message){
   pendingHostKey={ws};
   $('#host-key-host').textContent=`${message.host}:${message.port}`;$('#host-key-algorithm').textContent=message.algorithm;$('#host-key-fingerprint').textContent=message.fingerprint;
   const changed=!!message.changed;$('#host-key-title').textContent=changed?'主机身份已变化':'验证主机身份';$('#host-key-message').textContent=changed?'服务器返回的主机密钥与已信任记录不一致。':'首次连接此服务器，请核对以下指纹后再决定是否信任。';
-  $('#host-key-warning').classList.toggle('hidden',!changed);$('#host-key-warning').textContent=changed?'这可能表示服务器已重装，也可能存在中间人攻击。为保护连接，本次无法继续。':'';$('#host-key-accept').classList.toggle('hidden',changed);$('#host-key-cancel').textContent=changed?'关闭':'取消';
+  $('#host-key-warning').classList.toggle('hidden',!changed);$('#host-key-warning').textContent=changed?'这可能表示服务器已重装，也可能存在中间人攻击。请先通过可信渠道核对新指纹；确认无误后，可以信任新指纹并重新连接。':'';
+  $('#host-key-accept').classList.remove('hidden');$('#host-key-accept').textContent=changed?'信任新指纹并连接':'信任并连接';$('#host-key-cancel').textContent='取消';
   $('#host-key-dialog').showModal();$('#host-key-cancel').focus();
 }
 $('#host-key-form').addEventListener('submit',e=>{e.preventDefault();answerHostKey(true)});$('#host-key-cancel').onclick=()=>answerHostKey(false);$('#host-key-dialog').addEventListener('cancel',e=>{e.preventDefault();answerHostKey(false)});

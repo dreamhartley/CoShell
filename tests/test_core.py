@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import sqlite3
@@ -14,7 +15,7 @@ from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry
 from app.vault import Vault, VaultError
 from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
-from app.schemas import SSHKeyGenerateBody, ShortcutBody
+from app.schemas import SSHKeyGenerateBody, ServerBody, ShortcutBody
 from app import main as main_app
 from app.main import agent_message_with_terminal_context, agent_workspace_executor, agents, terminal_agents
 from app.agent_workspace import AgentWorkspace
@@ -873,3 +874,100 @@ def test_accepted_host_key_is_trusted_for_connection_retry(tmp_path):
         policy.missing_host_key(client, "example.test", other_key)
     assert changed.value.changed is True
     db.close()
+
+
+def test_server_address_change_resets_cached_os_icon(monkeypatch, tmp_path):
+    database = Database(tmp_path / "servers.db")
+    test_vault = Vault(database)
+    server_id = database.execute(
+        "INSERT INTO servers(name,host,port,username,os_type) VALUES(?,?,?,?,?)",
+        ("prod", "old.example.test", 22, "root", "ubuntu"),
+    ).lastrowid
+    monkeypatch.setattr(main_app, "db", database)
+    monkeypatch.setattr(main_app, "vault", test_vault)
+
+    unchanged = ServerBody(name="renamed", host="old.example.test", port=22, username="root", note="updated")
+    main_app.update_server(server_id, unchanged)
+    assert database.fetchone("SELECT os_type FROM servers WHERE id=?", (server_id,))["os_type"] == "ubuntu"
+
+    access_changed = ServerBody(name="renamed", host="old.example.test", port=22, username="admin", note="updated")
+    assert main_app.update_server(server_id, access_changed)["os_type"] == "default"
+
+    database.execute("UPDATE servers SET os_type='ubuntu' WHERE id=?", (server_id,))
+    moved = ServerBody(name="renamed", host="new.example.test", port=2222, username="admin", note="updated")
+    result = main_app.update_server(server_id, moved)
+    assert result["os_type"] == "default"
+    assert database.fetchone("SELECT os_type FROM servers WHERE id=?", (server_id,))["os_type"] == "default"
+    database.close()
+
+
+def test_changed_host_key_can_be_retrusted_and_forces_os_redetection(monkeypatch, tmp_path):
+    import paramiko
+
+    database = Database(tmp_path / "changed-host-key.db")
+    server_id = database.execute(
+        "INSERT INTO servers(name,host,port,username,os_type) VALUES(?,?,?,?,?)",
+        ("prod", "example.test", 22, "root", "ubuntu"),
+    ).lastrowid
+    changed_key = paramiko.RSAKey.generate(1024)
+
+    class FakeChannel:
+        closed = True
+
+        def settimeout(self, _timeout):
+            pass
+
+    session = SimpleNamespace(id="session-1", channel=FakeChannel())
+
+    class FakeSessions:
+        def __init__(self):
+            self.attempts = 0
+
+        def connect(self, data):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise HostKeyRequired("example.test", 22, changed_key, changed=True)
+            assert data["trusted_host_key"] is changed_key
+            return session
+
+        def close(self, _session_id):
+            pass
+
+    class FakeWebSocket:
+        headers = {}
+
+        def __init__(self):
+            self.received = iter([
+                {"type": "connect", "server_id": server_id, "cols": 100, "rows": 30},
+                {"type": "trust_host", "accept": True},
+                {"type": "close"},
+            ])
+            self.sent = []
+
+        async def accept(self):
+            pass
+
+        async def receive_json(self):
+            return next(self.received)
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code=None):
+            pass
+
+    fake_sessions = FakeSessions()
+    websocket = FakeWebSocket()
+    monkeypatch.setattr(main_app, "db", database)
+    monkeypatch.setattr(main_app, "vault", Vault(database))
+    monkeypatch.setattr(main_app, "sessions", fake_sessions)
+    monkeypatch.setattr(main_app, "detect_remote_os", lambda _session: "debian")
+
+    asyncio.run(main_app.terminal_socket(websocket))
+
+    assert fake_sessions.attempts == 2
+    assert any(message["type"] == "host_key" and message["changed"] for message in websocket.sent)
+    assert any(message["type"] == "connected" for message in websocket.sent)
+    assert database.fetchone("SELECT key_base64 FROM host_keys WHERE host=? AND port=?", ("example.test", 22))["key_base64"] == changed_key.get_base64()
+    assert database.fetchone("SELECT os_type FROM servers WHERE id=?", (server_id,))["os_type"] == "debian"
+    database.close()
