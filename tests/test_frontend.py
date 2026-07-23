@@ -244,8 +244,52 @@ def test_shortcuts_use_compact_rows_context_menu_and_code_editor():
     assert "Enter:shortcutEditorNewline" in javascript
     assert "function shortcutEditorNewline" in javascript
     assert "opensBlock" in javascript
+    assert "keepShortcutBlankClickInView(cm)" in javascript
     assert ".shortcut-row" in css
     assert ".shortcut-code-field .CodeMirror" in css
+
+
+def test_shortcut_editor_blank_click_uses_visible_column_instead_of_long_line_end():
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    handler_source = javascript[
+        javascript.index("function keepShortcutBlankClickInView"):
+        javascript.index("function openEditor")
+    ]
+    context = quickjs.Context()
+    result = context.eval(
+        """
+        let handler;
+        const calls=[];
+        const editor={
+          on(_name,value){handler=value},
+          coordsChar(coords){
+            calls.push(['coords',coords.left,coords.top]);
+            return calls.length===1
+              ? {line:0,ch:240,outside:1}
+              : {line:0,ch:18};
+          },
+          lastLine(){return 0},
+          charCoords(){return {top:10,bottom:30}},
+          focus(){calls.push(['focus'])},
+          setCursor(pos){calls.push(['cursor',pos.line,pos.ch])},
+          extendSelection(pos){calls.push(['extend',pos.line,pos.ch])}
+        };
+        const event={
+          button:0,clientX:150,clientY:200,
+          preventDefault(){calls.push(['prevent'])}
+        };
+        """
+        + handler_source
+        + """
+        keepShortcutBlankClickInView(editor);
+        handler(editor,event);
+        JSON.stringify(calls);
+        """
+    )
+    assert result == (
+        '[["coords",150,200],["prevent"],["coords",150,20],'
+        '["focus"],["cursor",0,18]]'
+    )
 
 
 def test_host_library_replaces_sidebar_server_panel_and_supports_card_actions():
