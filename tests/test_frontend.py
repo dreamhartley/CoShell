@@ -414,6 +414,11 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert "已插入终端内容 ${pendingContext.lineCount}行" in javascript
     assert "tab.agentPendingContext=null;renderAgentChat();$('#agent-chat-input').focus()" in javascript
     assert ".agent-input-shell.has-terminal-context textarea{padding-top:13px;text-indent:" in css
+    assert ".agent-input-shell{overflow:hidden;padding-bottom:48px}" in css
+    assert ".agent-composer textarea{width:calc(100% - 8px);height:88px;min-height:88px;padding:13px 14px 10px;overflow-y:auto" in css
+    assert ".agent-composer textarea::-webkit-scrollbar-track{margin:9px 0" in css
+    assert ".agent-composer textarea::-webkit-scrollbar-thumb{min-height:28px;border:3px solid transparent" in css
+    assert ".agent-composer textarea::-webkit-scrollbar-button{display:none" in css
     assert "tag.offsetWidth+7" in javascript
     assert ".agent-terminal-context-tag{" in css
     assert 'placeholder="Enter 发送，Shift+Enter 换行"' in html
