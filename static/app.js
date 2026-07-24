@@ -1,7 +1,7 @@
 const $ = (q, root=document) => root.querySelector(q);
 const $$ = (q, root=document) => [...root.querySelectorAll(q)];
 const storedSidebarAgentPermissionMode=sessionStorage.getItem('coshell-sidebar-agent-permission-mode');
-const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, sidebarAgentPermissionMode:storedSidebarAgentPermissionMode==='full_access'?'full_access':'request_approval', sidebarAgentPermissionPrompt:false, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}};
+const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, appInfo:null, updateInfo:null, updateChecking:false, sidebarAgentPermissionMode:storedSidebarAgentPermissionMode==='full_access'?'full_access':'request_approval', sidebarAgentPermissionPrompt:false, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}};
 
 async function api(path, options={}) {
   const res = await fetch(path, {headers: options.body instanceof FormData ? {} : {'Content-Type':'application/json'}, ...options});
@@ -372,6 +372,111 @@ async function refreshStatus(){
   $('#vault-help').textContent=state.vault.vault_initialized?'输入主密码即可使用保存的服务器凭据。':'首次使用，请设置至少 8 位的主密码。';
   const initialized=state.vault.vault_initialized,unlocked=state.vault.vault_unlocked;$('#settings-vault-status').textContent=!initialized?'尚未初始化':unlocked?'保险库已解锁':'保险库已锁定';$('#settings-vault-indicator').textContent=unlocked?'已解锁':'已锁定';$('#settings-vault-indicator').classList.toggle('good',unlocked);$('#settings-vault-lock').disabled=!unlocked;$('#settings-vault-unlock').textContent=initialized?'解锁':'初始化';
 }
+function desktopUpdateBridge(waitMs=0){
+  const current=window.pywebview?.api;
+  if(current||!waitMs)return Promise.resolve(current||null);
+  return new Promise(resolve=>{
+    let settled=false;
+    const finish=()=>{if(settled)return;settled=true;window.removeEventListener('pywebviewready',ready);resolve(window.pywebview?.api||null)};
+    const ready=()=>finish();
+    window.addEventListener('pywebviewready',ready,{once:true});
+    setTimeout(finish,waitMs);
+  });
+}
+function updateErrorMessage(error){return error?.message||String(error||'未知错误')}
+function renderUpdateInfo(info=state.updateInfo||state.appInfo){
+  if(!info)return;
+  $('#update-current-version').textContent=info.current_version||'0.3.0';
+  const card=$('#update-status-card'),title=$('#update-status-title'),install=$('#update-install'),releaseLink=$('#update-release-link');
+  card.classList.remove('good','available','error');
+  install.classList.toggle('hidden',!(info.update_available&&info.can_install));
+  releaseLink.classList.toggle('hidden',!info.release_url);
+  if(info.release_url)releaseLink.href=info.release_url;
+  if(info.checking){
+    title.textContent='正在检查更新…';
+  }else if(info.error){
+    card.classList.add('error');
+    title.textContent=`检查更新失败：${info.error}`;
+  }else if(info.update_available){
+    card.classList.add('available');
+    title.textContent=`发现新版本 ${info.latest_version}`;
+  }else if(info.checked){
+    card.classList.add('good');
+    title.textContent='当前已是最新版本';
+  }else if(!info.packaged){
+    title.textContent='源码运行模式';
+  }else{
+    title.textContent='尚未检查更新';
+  }
+}
+async function loadApplicationInfo(){
+  state.appInfo=await api('/api/app-info');
+  state.updateInfo={...state.appInfo};
+  renderUpdateInfo();
+}
+async function checkForUpdates(manual=true){
+  if(state.updateChecking)return;
+  state.updateChecking=true;
+  const button=$('#update-check');
+  button.disabled=true;
+  button.textContent='检查中…';
+  state.updateInfo={...(state.updateInfo||state.appInfo||{}),checking:true,error:null};
+  renderUpdateInfo();
+  try{
+    const desktop=await desktopUpdateBridge(2500);
+    if(!desktop?.check_for_updates)throw new Error('更新检查仅在桌面应用中可用；你仍可前往 GitHub Releases 查看版本。');
+    const result=await desktop.check_for_updates();
+    state.updateInfo=result;
+    renderUpdateInfo();
+    if(result.update_available){
+      toast(`发现新版本 ${result.latest_version}${result.can_install?'，可在“设置 → 更新”中安装':''}`);
+    }else if(manual){
+      toast('当前已是最新版本');
+    }
+  }catch(error){
+    const message=updateErrorMessage(error);
+    state.updateInfo={...(state.updateInfo||state.appInfo||{}),checking:false,error:message};
+    renderUpdateInfo();
+    if(manual)toast(message,true);
+  }finally{
+    state.updateChecking=false;
+    button.disabled=false;
+    button.textContent='检查更新';
+  }
+}
+$('#update-check').onclick=()=>checkForUpdates(true);
+$('#update-install').onclick=async()=>{
+  const info=state.updateInfo;
+  if(!info?.update_available||!info.can_install)return;
+  const confirmed=await themedConfirm(`将下载并安装 CoShell ${info.latest_version}，完成后自动关闭并重启应用。\n\n现有 SSH 连接会断开，data 数据目录会保留。`,{title:'安装更新',confirmText:'下载并安装'});
+  if(!confirmed)return;
+  const button=$('#update-install'),check=$('#update-check');
+  button.disabled=true;
+  check.disabled=true;
+  button.textContent='正在下载并安装…';
+  $('#update-status-title').textContent=`正在安装 ${info.latest_version}`;
+  try{
+    const desktop=await desktopUpdateBridge(2500);
+    if(!desktop?.download_and_install_update)throw new Error('当前环境不支持自动安装更新');
+    await desktop.download_and_install_update();
+    $('#update-status-title').textContent='更新已准备完成';
+    toast('更新已下载，应用即将重启');
+  }catch(error){
+    const message=updateErrorMessage(error);
+    state.updateInfo={...info,error:message};
+    renderUpdateInfo();
+    toast(message,true);
+    button.disabled=false;
+    check.disabled=false;
+    button.textContent='下载并安装';
+  }
+};
+$$('.update-external-link').forEach(link=>link.addEventListener('click',event=>{
+  const desktop=window.pywebview?.api;
+  if(!desktop?.open_external_url)return;
+  event.preventDefault();
+  Promise.resolve(desktop.open_external_url(link.href)).catch(error=>toast(updateErrorMessage(error),true));
+}));
 function openVault(){ $('#vault-form').reset(); $('#vault-dialog').showModal(); }
 $('#vault-form').addEventListener('submit',async e=>{e.preventDefault();const form=new FormData(e.target),password=form.get('password');try{await api(state.vault.vault_initialized?'/api/vault/unlock':'/api/vault/initialize',{method:'POST',body:JSON.stringify({password})});if(form.get('remember'))await api('/api/vault/remember',{method:'POST',body:JSON.stringify({password})});else await api('/api/vault/remember',{method:'DELETE'});localStorage.removeItem('webssh-vault-password');sessionStorage.removeItem('webssh-vault-password');$('#vault-dialog').close();await refreshStatus();toast('保险库已解锁');if(state.pendingReconnect){const tab=state.pendingReconnect;state.pendingReconnect=null;reconnectTab(tab)}}catch(err){toast(err.message,true)}});
 async function loadAgentSettings(){state.agentSettings=await api('/api/agent/settings');const f=$('#agent-settings-form');f.elements.api_url.value=state.agentSettings.api_url;f.elements.api_key.value='';f.elements.builtin_web_search.checked=state.agentSettings.builtin_web_search!==false;$('#agent-key-status').textContent=state.agentSettings.api_key_configured?'已保存加密密钥；留空不会覆盖。':'尚未保存密钥；无鉴权的兼容接口可以留空。';setModelOptions([],state.agentSettings.model)}
@@ -723,5 +828,5 @@ $('#sidebar-toggle').onclick=()=>{$('#sidebar').classList.toggle('collapsed');sc
 window.addEventListener('resize',()=>scheduleTerminalFit(activeTab()));
 new ResizeObserver(()=>fitTerminal(activeTab())).observe($('#terminals'));
 
-async function init(){applyTheme(currentTheme(),false);await restoreTheme();await refreshStatus();await autoUnlockVault();await Promise.all([loadServers(),loadShortcuts(),loadSSHKeys()]);const tabs=await api('/api/tabs');tabs.forEach(data=>{const tab=newTerminal(data);if(tab)showReconnectPrompt(tab)});if(!tabs.length)activateTab(null);else activateTab(tabs[0].id)}
+async function init(){applyTheme(currentTheme(),false);await restoreTheme();await Promise.all([refreshStatus(),loadApplicationInfo()]);await autoUnlockVault();await Promise.all([loadServers(),loadShortcuts(),loadSSHKeys()]);const tabs=await api('/api/tabs');tabs.forEach(data=>{const tab=newTerminal(data);if(tab)showReconnectPrompt(tab)});if(!tabs.length)activateTab(null);else activateTab(tabs[0].id);if(state.appInfo?.packaged)checkForUpdates(false)}
 init().catch(err=>toast(err.message,true));

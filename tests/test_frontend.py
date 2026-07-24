@@ -70,6 +70,32 @@ def test_settings_exposes_backup_and_restore_controls():
     assert "themedConfirm('还原会整体替换" in javascript
 
 
+def test_settings_exposes_release_update_and_thanks_page():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+
+    assert 'data-settings-panel="update"' in html
+    assert 'id="settings-update"' in html
+    assert 'src="/assets/app-icon.png"' in html
+    assert 'id="update-current-version">0.3.0' in html
+    assert "https://github.com/dreamhartley/CoShell" in html
+    assert "感谢你使用 CoShell。如果你喜欢这个项目，欢迎前往 GitHub 点一个" in html
+    assert '<span class="update-star-inline">Star ⭐</span>' in html
+    assert ".update-star-inline{white-space:nowrap}" in css
+    assert "自动安装仅支持 Windows 发行版" not in html
+    assert html.count('>GitHub 仓库</a>') == 1
+    assert ">去点 Star</a>" not in html
+    assert 'id="update-check"' in html
+    assert 'id="update-install"' in html
+    assert 'id="update-status-detail"' not in html
+    assert "update-status-detail" not in javascript
+    assert "check_for_updates" in javascript
+    assert "download_and_install_update" in javascript
+    assert "if(state.appInfo?.packaged)checkForUpdates(false)" in javascript
+    assert ".update-app-icon{display:block;width:132px;height:132px;margin:0 auto" in css
+
+
 def test_settings_can_generate_and_optionally_import_ssh_key_pair():
     html = Path("static/index.html").read_text(encoding="utf-8")
     javascript = Path("static/app.js").read_text(encoding="utf-8")

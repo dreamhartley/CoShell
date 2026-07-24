@@ -1,2 +1,3 @@
-"""Lightweight local Web SSH terminal."""
+"""CoShell local SSH/SFTP workstation."""
 
+__version__ = "0.3.0"

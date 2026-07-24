@@ -8,7 +8,11 @@ import socket
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
+from urllib.parse import urlparse
+
+from .updater import REPOSITORY_URL, UpdateManager
 
 
 DEFAULT_WINDOW_SIZE = (1440, 900)
@@ -119,7 +123,11 @@ class DesktopApi:
     def __init__(self) -> None:
         self._clipboard_lock = threading.RLock()
         self._connection_lock = threading.RLock()
+        self._update_lock = threading.RLock()
         self._active_connections = 0
+        self._update_in_progress = False
+        self._window: object | None = None
+        self._updater = UpdateManager()
 
     def read_clipboard(self) -> str:
         with self._clipboard_lock:
@@ -138,6 +146,52 @@ class DesktopApi:
     def has_active_connections(self) -> bool:
         with self._connection_lock:
             return self._active_connections > 0
+
+    def attach_window(self, window: object) -> None:
+        self._window = window
+
+    def check_for_updates(self) -> dict[str, object]:
+        return self._updater.check()
+
+    def download_and_install_update(self) -> dict[str, object]:
+        with self._update_lock:
+            if self._update_in_progress:
+                raise RuntimeError("更新安装已经开始")
+            result = self._updater.prepare()
+            self._updater.launch()
+            self._update_in_progress = True
+            threading.Timer(0.75, self._close_for_update).start()
+            return result
+
+    def _close_for_update(self) -> None:
+        window = self._window
+        if window is None or not hasattr(window, "destroy"):
+            return
+        try:
+            window.destroy()
+        except Exception:
+            # The external updater will time out without modifying files if
+            # the current process cannot be closed.
+            with self._update_lock:
+                self._update_in_progress = False
+
+    def is_update_in_progress(self) -> bool:
+        with self._update_lock:
+            return self._update_in_progress
+
+    def open_external_url(self, value: str) -> bool:
+        parsed = urlparse(str(value))
+        repository = urlparse(REPOSITORY_URL)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != repository.hostname
+            or (
+                parsed.path.rstrip("/") != repository.path.rstrip("/")
+                and not parsed.path.startswith(repository.path.rstrip("/") + "/")
+            )
+        ):
+            raise RuntimeError("只允许打开 CoShell GitHub 仓库链接")
+        return bool(webbrowser.open(value))
 
 
 def _data_dir() -> Path:
@@ -263,12 +317,17 @@ def run_desktop() -> None:
             confirm_close=False,
             localization={"global.quitConfirmation": "仍有主机保持连接，确定退出吗？"},
         )
+        if window is not None:
+            desktop_api.attach_window(window)
         if window is not None and hasattr(window, "events"):
             # WinForms reports physical pixels while create_window expects
             # logical pixels. Persist the normalized final dimensions from the
             # locking closing event so resize worker threads cannot race.
             def prepare_window_close() -> None:
-                window.confirm_close = desktop_api.has_active_connections()
+                window.confirm_close = (
+                    desktop_api.has_active_connections()
+                    and not desktop_api.is_update_in_progress()
+                )
                 _save_window_size(*_logical_window_size(window))
 
             window.events.closing += prepare_window_close

@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from urllib.request import urlopen
 
+import pytest
+
 
 class FakeEvent:
     def __init__(self):
@@ -64,6 +66,8 @@ def test_desktop_launcher_serves_app_and_stops(monkeypatch, tmp_path):
     assert captured["options"]["min_size"] == (960, 640)
     assert captured["options"]["js_api"].read_clipboard
     assert captured["options"]["js_api"].write_clipboard
+    assert captured["options"]["js_api"].check_for_updates
+    assert captured["options"]["js_api"].download_and_install_update
     assert captured["options"]["js_api"].has_active_connections()
     assert captured["options"]["localization"]["global.quitConfirmation"] == "仍有主机保持连接，确定退出吗？"
     assert captured["start_options"]["private_mode"] is False
@@ -104,6 +108,19 @@ def test_desktop_api_tracks_active_connections():
     assert api.has_active_connections() is True
     assert api.set_active_connections(0) is True
     assert api.has_active_connections() is False
+
+
+def test_desktop_api_only_opens_repository_links(monkeypatch):
+    import app.desktop as desktop
+
+    opened = []
+    monkeypatch.setattr(desktop.webbrowser, "open", lambda value: opened.append(value) or True)
+    api = desktop.DesktopApi()
+
+    assert api.open_external_url("https://github.com/dreamhartley/CoShell/releases") is True
+    with pytest.raises(RuntimeError):
+        api.open_external_url("https://github.com/dreamhartley/CoShell-malicious")
+    assert opened == ["https://github.com/dreamhartley/CoShell/releases"]
 
 
 def test_physical_window_size_is_normalized_for_high_dpi():

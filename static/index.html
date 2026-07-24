@@ -143,6 +143,7 @@
         <button type="button" class="settings-tab" data-settings-panel="agent">Agent</button>
         <button type="button" class="settings-tab" data-settings-panel="theme">主题</button>
         <button type="button" class="settings-tab" data-settings-panel="backup">备份/还原</button>
+        <button type="button" class="settings-tab" data-settings-panel="update">更新</button>
       </nav>
       <section id="settings-vault" class="settings-panel active">
         <div class="setting-summary"><div><strong>凭据保险库</strong><p id="settings-vault-status" class="muted"></p></div><span id="settings-vault-indicator" class="status-pill"></span></div>
@@ -214,6 +215,26 @@
           <label>选择 JSON 备份文件<input id="backup-file" type="file" accept="application/json,.json"></label>
           <small>还原会整体替换当前应用数据、断开现有 SSH 连接，并锁定密码库。之后请使用备份创建时的主密码解锁。</small>
           <div class="dialog-actions"><button id="backup-restore" type="button" class="danger">还原并替换当前数据</button></div>
+        </div>
+      </section>
+      <section id="settings-update" class="settings-panel">
+        <div class="update-about">
+          <img class="update-app-icon" src="/assets/app-icon.png" width="132" height="132" alt="CoShell 项目图标">
+          <h3>CoShell</h3>
+          <p class="update-version">当前版本 <strong id="update-current-version">0.3.0</strong></p>
+          <p class="muted">感谢你使用 CoShell。如果你喜欢这个项目，欢迎前往 GitHub 点一个 <span class="update-star-inline">Star ⭐</span></p>
+          <div class="update-links">
+            <a class="update-external-link" href="https://github.com/dreamhartley/CoShell" target="_blank" rel="noopener noreferrer">GitHub 仓库</a>
+          </div>
+        </div>
+        <div id="update-status-card" class="update-status-card" aria-live="polite">
+          <span id="update-status-dot" class="update-status-dot"></span>
+          <strong id="update-status-title">尚未检查更新</strong>
+        </div>
+        <div class="update-actions">
+          <a id="update-release-link" class="update-release-link hidden update-external-link" href="https://github.com/dreamhartley/CoShell/releases" target="_blank" rel="noopener noreferrer">查看发行说明</a>
+          <button id="update-check" type="button">检查更新</button>
+          <button id="update-install" class="primary hidden" type="button">下载并安装</button>
         </div>
       </section>
     </div>

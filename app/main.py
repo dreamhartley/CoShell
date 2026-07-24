@@ -33,12 +33,14 @@ from .mcp import MCPError, call_tool as call_mcp_tool, list_tools as list_mcp_to
 from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
 from .searxng_backend import SearxNGService
 from .ssh import HostKeyRequired, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair
+from .updater import application_info
 from .vault import Vault, VaultError
 
 
 BASE = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("WEBSSH_DATA_DIR", BASE / "data"))
 STATIC = BASE / "static"
+ASSETS = BASE / "assets"
 db = Database(DATA / "webssh.db")
 vault = Vault(db)
 sessions = SessionRegistry(db)
@@ -100,6 +102,11 @@ def ensure_ssh_key(key_id: int | None) -> None:
 @app.get("/api/status")
 def status():
     return {"vault_initialized": vault.initialized, "vault_unlocked": vault.unlocked}
+
+
+@app.get("/api/app-info")
+def app_info():
+    return application_info()
 
 
 @app.post("/api/vault/initialize")
@@ -1326,6 +1333,7 @@ async def terminal_socket(ws: WebSocket):
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+app.mount("/assets", StaticFiles(directory=ASSETS), name="assets")
 
 
 @app.get("/")
