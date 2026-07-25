@@ -722,7 +722,59 @@ function keepShortcutBlankClickInView(editor){editor.on('mousedown',(cm,event)=>
 function openEditor(title,fields,submit){$('#editor-title').textContent=title;const root=$('#editor-fields'),dialog=$('#editor-dialog'),codeEditors=[];root.replaceChildren();dialog.classList.toggle('shortcut-editor-dialog',fields.some(field=>field[3]==='code'));fields.forEach(([name,label,value,type='text',options={}])=>{const l=document.createElement('label');const caption=document.createElement('span');caption.textContent=label;l.append(caption);let input;if(type==='textarea'||type==='code'){input=document.createElement('textarea');input.rows=type==='code'?10:6}else if(type==='select'){input=document.createElement('select');input.innerHTML='<option value="password">密码</option><option value="private_key">私钥</option>'}else if(type==='sshkey'){input=document.createElement('select');input.add(new Option('不使用密码库密钥',''));for(const key of state.sshKeys)input.add(new Option(`${key.name} · ${key.key_type}`,String(key.id)))}else{input=document.createElement('input');input.type=type}input.name=name;input.autocomplete=type==='password'?'new-password':'off';input.value=value??'';for(const [key,option] of Object.entries(options)){if(typeof option==='boolean')input[key]=option;else input.setAttribute(key,String(option))}if(type==='code')l.classList.add('shortcut-code-field');l.append(input);root.append(l);if(type==='code'){const cm=CodeMirror.fromTextArea(input,{mode:'shell',lineNumbers:true,indentUnit:2,tabSize:2,indentWithTabs:false,smartIndent:true,matchBrackets:true,styleActiveLine:true,lineWrapping:false,theme:themeModes[currentTheme()]==='dark'?'material-darker':'default',extraKeys:{Enter:shortcutEditorNewline,Tab:editor=>editor.somethingSelected()?editor.indentSelection('add'):editor.execCommand('insertSoftTab'),'Shift-Tab':editor=>editor.indentSelection('subtract')}});keepShortcutBlankClickInView(cm);codeEditors.push(cm)}});$('#editor-form').onsubmit=async e=>{e.preventDefault();codeEditors.forEach(cm=>cm.save());try{const data=Object.fromEntries(new FormData(e.target));if(codeEditors.length&&!String(data.command||'').trim())throw new Error('请输入命令或脚本');await submit(data);dialog.close();toast('已保存')}catch(err){toast(err.message,true)}};dialog.showModal();setTimeout(()=>{codeEditors.forEach(cm=>cm.refresh());(codeEditors[0]||$('input,textarea,select',root))?.focus()},30)}
 
 async function loadSftp(path){const tab=activeTab(),root=$('#file-list');if(!tab?.sessionId){root.innerHTML='<div class="empty">连接 SSH 后浏览文件</div>';return}path=path||$('#sftp-path').value||tab.last_path||'.';root.innerHTML='<div class="empty">正在加载…</div>';try{const data=await api(`/api/sftp/list?session_id=${encodeURIComponent(tab.sessionId)}&path=${encodeURIComponent(path)}`);tab.last_path=data.path;$('#sftp-path').value=data.path;saveTabs();renderFiles(data.items)}catch(err){root.innerHTML=`<div class="empty">${esc(err.message)}</div>`}}
-function renderFiles(items){const root=$('#file-list');root.replaceChildren();state.selectedFiles.clear();updateBatch();items.forEach(item=>{const row=document.createElement('div');row.className='file-row';row.innerHTML=`<input type="checkbox" aria-label="选择 ${esc(item.name)}"><span>${item.is_dir?'📁':'📄'}</span><span class="file-name" title="${esc(item.name)}">${esc(item.name)}</span><span class="file-size">${item.is_dir?'':formatSize(item.size)}</span>`;const check=$('input',row);check.onchange=()=>{check.checked?state.selectedFiles.add(item):state.selectedFiles.delete(item);updateBatch()};row.ondblclick=e=>{if(e.target!==check)(item.is_dir?loadSftp(joinRemote(activeTab().last_path,item.name)):openFileEditor(joinRemote(activeTab().last_path,item.name)))};row.oncontextmenu=e=>showFileMenu(e,item);root.append(row)});const tab=activeTab();for(const task of state.uploadTasks.values())if(task.tabId===tab?.id&&task.directory===tab.last_path)renderUploadTask(task);if(!root.children.length)root.innerHTML='<div class="empty">空目录</div>'}
+const sftpIconByExtension=Object.freeze({
+  txt:'text',log:'text',rtf:'text',nfo:'text',
+  conf:'config',cfg:'config',ini:'config',env:'config',properties:'config',editorconfig:'config',service:'config',desktop:'config',rc:'config',lock:'config',
+  toml:'toml',
+  json:'json',json5:'json',jsonl:'json',
+  yaml:'yaml',yml:'yaml',
+  xml:'xml',xsd:'xml',xsl:'xml',plist:'xml',
+  md:'markdown',mdx:'markdown',markdown:'markdown',
+  js:'javascript',mjs:'javascript',cjs:'javascript',jsx:'javascript',
+  ts:'typescript',mts:'typescript',cts:'typescript',tsx:'typescript',
+  py:'python',pyw:'python',pyi:'python',pyc:'python',
+  sh:'shell',bash:'shell',zsh:'shell',fish:'shell',ksh:'shell',csh:'shell',tcsh:'shell',
+  ps1:'powershell',psm1:'powershell',psd1:'powershell',
+  html:'html',htm:'html',xhtml:'html',
+  css:'css',scss:'css',sass:'css',less:'css',
+  c:'c',h:'c',
+  cc:'cpp',cpp:'cpp',cxx:'cpp',hpp:'cpp',hh:'cpp',hxx:'cpp',
+  cs:'csharp',csproj:'csharp',
+  java:'java',jar:'java',class:'java',war:'java',
+  php:'php',phtml:'php',
+  sql:'sql',
+  db:'database',sqlite:'database',sqlite3:'database',mdb:'database',
+  svg:'svg',
+  png:'image',jpg:'image',jpeg:'image',gif:'image',bmp:'image',webp:'image',ico:'image',tif:'image',tiff:'image',avif:'image',heic:'image',
+  mp3:'audio',wav:'audio',flac:'audio',aac:'audio',ogg:'audio',m4a:'audio',wma:'audio',opus:'audio',
+  mp4:'video',mkv:'video',avi:'video',mov:'video',webm:'video',wmv:'video',flv:'video',m4v:'video',mpeg:'video',mpg:'video',
+  zip:'archive','7z':'archive',rar:'archive',tar:'archive',gz:'archive',bz2:'archive',xz:'archive',tgz:'archive',tbz2:'archive',txz:'archive',zst:'archive',lz:'archive',
+  pdf:'pdf',
+  doc:'word',docx:'word',docm:'word',dotx:'word',odt:'word',
+  xls:'excel',xlsx:'excel',xlsm:'excel',xlsb:'excel',ods:'excel',csv:'excel',tsv:'excel',
+  ppt:'powerpoint',pptx:'powerpoint',pptm:'powerpoint',odp:'powerpoint',
+  exe:'binary',dll:'binary',so:'binary',dylib:'binary',bin:'binary',appimage:'binary',msi:'binary',deb:'binary',rpm:'binary',apk:'binary',iso:'binary',img:'binary',wasm:'binary',
+  pem:'cert',crt:'cert',cer:'cert',cert:'cert',key:'cert',pub:'cert',pfx:'cert',p12:'cert',jks:'cert'
+});
+const sftpNamedIcons=Object.freeze({
+  dockerfile:'docker','docker-compose.yml':'docker','docker-compose.yaml':'docker','compose.yml':'docker','compose.yaml':'docker',
+  makefile:'config','cmakelists.txt':'config',hosts:'config',fstab:'config',crontab:'config',
+  license:'text',copying:'text',readme:'text',
+  authorized_keys:'cert',known_hosts:'cert'
+});
+function sftpFileIcon(name,isDir){
+  if(isDir)return 'default-folder';
+  const lower=String(name||'').toLowerCase();
+  if(sftpNamedIcons[lower])return sftpNamedIcons[lower];
+  if(lower.startsWith('dockerfile.'))return 'docker';
+  if(/^id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$/.test(lower))return 'cert';
+  if(/^\.(?:bashrc|zshrc|profile|bash_profile|zprofile|fishrc)$/.test(lower))return 'shell';
+  if(/^\.(?:gitignore|gitattributes|gitmodules|npmrc|yarnrc|prettierrc|eslintrc|htaccess)$/.test(lower))return 'config';
+  const dot=lower.lastIndexOf('.'),extension=dot>=0?lower.slice(dot+1):'';
+  return sftpIconByExtension[extension]||'default-file';
+}
+function sftpFileIconPath(item){return `/static/icons/files/${sftpFileIcon(item.name,item.is_dir)}.svg`}
+function renderFiles(items){const root=$('#file-list');root.replaceChildren();state.selectedFiles.clear();updateBatch();items.forEach(item=>{const row=document.createElement('div');row.className='file-row';row.innerHTML=`<input type="checkbox" aria-label="选择 ${esc(item.name)}"><img class="file-icon" src="${sftpFileIconPath(item)}" alt="" aria-hidden="true" draggable="false"><span class="file-name" title="${esc(item.name)}">${esc(item.name)}</span><span class="file-size">${item.is_dir?'':formatSize(item.size)}</span>`;const check=$('input',row);check.onchange=()=>{check.checked?state.selectedFiles.add(item):state.selectedFiles.delete(item);updateBatch()};row.ondblclick=e=>{if(e.target!==check)(item.is_dir?loadSftp(joinRemote(activeTab().last_path,item.name)):openFileEditor(joinRemote(activeTab().last_path,item.name)))};row.oncontextmenu=e=>showFileMenu(e,item);root.append(row)});const tab=activeTab();for(const task of state.uploadTasks.values())if(task.tabId===tab?.id&&task.directory===tab.last_path)renderUploadTask(task);if(!root.children.length)root.innerHTML='<div class="empty">空目录</div>'}
 function updateBatch(){$('#batch-btn').classList.toggle('hidden',!state.selectedFiles.size);$('#batch-btn').textContent=`批量操作 (${state.selectedFiles.size})`}
 $('#batch-btn').onclick=async()=>{const items=[...state.selectedFiles],tab=activeTab();if(!items.length||!tab)return;const action=await themedInput('输入批量操作：move / copy / delete');if(!action)return;try{if(action==='delete'){if(!await themedConfirm(`递归删除选中的 ${items.length} 项？`))return;for(const item of items)await api('/api/sftp/delete',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:joinRemote(tab.last_path,item.name)})})}else if(action==='move'||action==='copy'){const target=await themedInput('目标目录完整路径');if(!target)return;for(const item of items)await api(`/api/sftp/${action}`,{method:'POST',body:JSON.stringify({session_id:tab.sessionId,source:joinRemote(tab.last_path,item.name),destination:joinRemote(target,item.name),overwrite:false})})}else return toast('未知操作',true);toast('批量操作完成');loadSftp()}catch(err){toast(err.message,true)}};
 function formatSize(n){if(n<1024)return `${n} B`;if(n<1048576)return `${(n/1024).toFixed(1)} KB`;return `${(n/1048576).toFixed(1)} MB`}
@@ -776,7 +828,7 @@ async function reloadFileEditor(){if(state.editor.dirty&&!await themedConfirm('�
 async function closeFileEditor(){if(state.editor.dirty&&!await themedConfirm('文件尚未保存，确定关闭？'))return;$('#file-editor-dialog').close()}
 async function createNewFile(){const tab=activeTab();if(!tab?.sessionId)return toast('请先连接终端',true);const name=await themedInput('新文件名');if(!name)return;if(name.includes('/')||name.includes('\\')||name==='.'||name==='..')return toast('文件名不能包含路径分隔符',true);const path=joinRemote(tab.last_path,name);try{await api('/api/sftp/file',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path})});await loadSftp();await openFileEditor(path)}catch(err){toast(err.message,true)}}
 function downloadFile(name){const tab=activeTab(),path=joinRemote(tab.last_path,name);const a=document.createElement('a');a.href=`/api/sftp/download?session_id=${encodeURIComponent(tab.sessionId)}&path=${encodeURIComponent(path)}`;a.download=name;a.click()}
-function renderUploadTask(task){const root=$('#file-list');let row=$(`.upload-row[data-upload-key="${CSS.escape(task.key)}"]`,root);if(!row){$('.empty',root)?.remove();row=document.createElement('div');row.className='file-row upload-row';row.dataset.uploadKey=task.key;row.innerHTML=`<span></span><span>📄</span><span class="file-name"></span><span class="upload-progress"><span class="upload-ring"></span><span class="upload-percent">0%</span></span>`;$('.file-name',row).textContent=task.file.name;root.append(row)}const percent=task.file.size?Math.min(100,Math.round(task.written/task.file.size*100)):100;$('.upload-ring',row).style.setProperty('--progress',`${percent*3.6}deg`);$('.upload-percent',row).textContent=task.status==='error'?'失败':task.status==='finishing'?'校验中':`${percent}%`;row.classList.toggle('upload-error',task.status==='error')}
+function renderUploadTask(task){const root=$('#file-list');let row=$(`.upload-row[data-upload-key="${CSS.escape(task.key)}"]`,root);if(!row){$('.empty',root)?.remove();row=document.createElement('div');row.className='file-row upload-row';row.dataset.uploadKey=task.key;row.innerHTML=`<span></span><img class="file-icon" src="${sftpFileIconPath({name:task.file.name,is_dir:false})}" alt="" aria-hidden="true" draggable="false"><span class="file-name"></span><span class="upload-progress"><span class="upload-ring"></span><span class="upload-percent">0%</span></span>`;$('.file-name',row).textContent=task.file.name;root.append(row)}const percent=task.file.size?Math.min(100,Math.round(task.written/task.file.size*100)):100;$('.upload-ring',row).style.setProperty('--progress',`${percent*3.6}deg`);$('.upload-percent',row).textContent=task.status==='error'?'失败':task.status==='finishing'?'校验中':`${percent}%`;row.classList.toggle('upload-error',task.status==='error')}
 async function beginUpload(task,overwrite=false){const tab=state.tabs.find(t=>t.id===task.tabId);if(!tab?.sessionId)throw new Error('SSH 会话已断开');const init=await api('/api/sftp/uploads',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:task.directory,filename:task.file.name,size:task.file.size,overwrite})});task.uploadId=init.upload_id;const chunkSize=1024*1024;for(let offset=0;offset<task.file.size;offset+=chunkSize){const chunk=task.file.slice(offset,Math.min(offset+chunkSize,task.file.size));const result=await api(`/api/sftp/uploads/${task.uploadId}?offset=${offset}`,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:chunk});task.written=result.written;renderUploadTask(task)}task.status='finishing';renderUploadTask(task);await api(`/api/sftp/uploads/${task.uploadId}/finish`,{method:'POST'});task.status='done'}
 async function uploadFiles(files) {
   const tab = activeTab();

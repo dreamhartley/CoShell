@@ -216,6 +216,60 @@ def test_sftp_is_the_default_sidebar_panel():
     assert 'id="panel-agent" class="side-panel agent-panel active"' not in html
 
 
+def test_sftp_uses_vscode_file_type_icons():
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+    icon_dir = Path("static/icons/files")
+    icon_source = javascript[
+        javascript.index("const sftpIconByExtension="):
+        javascript.index("function renderFiles")
+    ]
+
+    cases = quickjs.Context().eval(
+        icon_source
+        + """
+        JSON.stringify([
+          ['folder',true],['README.md',false],['Dockerfile',false],
+          ['docker-compose.yaml',false],['SCRIPT.PS1',false],['.env',false],
+          ['.gitignore',false],['server.cpp',false],['data.sqlite3',false],
+          ['photo.JPEG',false],['music.flac',false],['movie.mp4',false],
+          ['backup.tar.gz',false],['document.pdf',false],['report.xlsx',false],
+          ['slides.pptx',false],['id_ed25519',false],['unknown.xyz',false]
+        ].map(([name,isDir])=>sftpFileIcon(name,isDir)))
+        """
+    )
+    assert cases == (
+        '["default-folder","markdown","docker","docker","powershell","config",'
+        '"config","cpp","database","image","audio","video","archive","pdf",'
+        '"excel","powerpoint","cert","default-file"]'
+    )
+    assert '<img class="file-icon" src="${sftpFileIconPath(item)}"' in javascript
+    assert "📁" not in javascript
+    assert "📄" not in javascript
+    assert ".file-icon{display:block;width:24px;height:24px" in css
+
+    expected_icons = {
+        "archive", "audio", "binary", "c", "cert", "config", "cpp", "csharp",
+        "css", "database", "default-file", "default-folder", "docker", "excel",
+        "html", "image", "java", "javascript", "json", "markdown", "pdf", "php",
+        "powerpoint", "powershell", "python", "shell", "sql", "svg", "text",
+        "toml", "typescript", "video", "word", "xml", "yaml",
+    }
+    assert {path.stem for path in icon_dir.glob("*.svg")} == expected_icons
+    for path in icon_dir.glob("*.svg"):
+        source = path.read_text(encoding="utf-8").lower()
+        assert "<svg" in source
+        assert "<script" not in source
+        assert "javascript:" not in source
+        assert "<foreignobject" not in source
+
+    sources = (icon_dir / "SOURCES.md").read_text(encoding="utf-8")
+    license_text = (icon_dir / "LICENSE.txt").read_text(encoding="utf-8")
+    assert "https://www.svgrepo.com/collection/vscode-icons/" in sources
+    assert "https://github.com/vscode-icons/vscode-icons" in sources
+    assert "Copyright (c) 2016 Roberto Huertas" in license_text
+
+
 def test_terminal_clipboard_prefers_native_desktop_bridge():
     javascript = Path("static/app.js").read_text(encoding="utf-8")
 
