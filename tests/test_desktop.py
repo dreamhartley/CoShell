@@ -170,19 +170,34 @@ def test_packaged_data_dir_respects_explicit_override(monkeypatch, tmp_path):
     assert Path(os.environ["WEBSSH_DATA_DIR"]) == override
 
 
-def test_packaged_pythonnet_runtime_is_unblocked_before_gui_import(monkeypatch, tmp_path):
+def test_packaged_runtime_dlls_are_unblocked_before_gui_import(monkeypatch, tmp_path):
     import app.desktop as desktop
 
-    runtime = tmp_path / "pythonnet" / "runtime" / "Python.Runtime.dll"
-    runtime.parent.mkdir(parents=True)
-    runtime.write_bytes(b"runtime")
-    zone_marker = Path(f"{runtime}:Zone.Identifier")
-    zone_marker.write_text("[ZoneTransfer]\nZoneId=3\n", encoding="utf-8")
+    runtime_files = [
+        tmp_path / "pythonnet" / "runtime" / "Python.Runtime.dll",
+        tmp_path / "webview" / "lib" / "Microsoft.Web.WebView2.Core.dll",
+        tmp_path / "webview" / "lib" / "Microsoft.Web.WebView2.WinForms.dll",
+    ]
+    for runtime_file in runtime_files:
+        runtime_file.parent.mkdir(parents=True, exist_ok=True)
+        runtime_file.write_bytes(b"runtime")
+        Path(f"{runtime_file}:Zone.Identifier").write_text(
+            "[ZoneTransfer]\nZoneId=3\n",
+            encoding="utf-8",
+        )
+    non_runtime_file = tmp_path / "webview" / "lib" / "settings.json"
+    non_runtime_file.write_text("{}", encoding="utf-8")
+    non_runtime_marker = Path(f"{non_runtime_file}:Zone.Identifier")
+    non_runtime_marker.write_text("[ZoneTransfer]\nZoneId=3\n", encoding="utf-8")
     monkeypatch.setattr(desktop.sys, "frozen", True, raising=False)
     monkeypatch.setattr(desktop.sys, "platform", "win32")
     monkeypatch.setattr(desktop, "_resource_path", lambda relative: tmp_path / relative)
 
-    desktop._unblock_packaged_pythonnet_runtime()
+    desktop._unblock_packaged_runtime_files()
 
-    assert runtime.read_bytes() == b"runtime"
-    assert not zone_marker.exists()
+    assert all(runtime_file.read_bytes() == b"runtime" for runtime_file in runtime_files)
+    assert all(
+        not Path(f"{runtime_file}:Zone.Identifier").exists()
+        for runtime_file in runtime_files
+    )
+    assert non_runtime_marker.exists()

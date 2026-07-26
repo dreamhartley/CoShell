@@ -264,19 +264,19 @@ def _configure_packaged_data_dir() -> None:
     os.environ["WEBSSH_DATA_DIR"] = str(Path(sys.executable).resolve().parent / "data")
 
 
-def _unblock_packaged_pythonnet_runtime() -> None:
-    """Remove Explorer's download-zone marker before pythonnet loads its DLL."""
+def _unblock_packaged_runtime_files() -> None:
+    """Remove Explorer's download-zone marker before .NET loads bundled DLLs."""
     if sys.platform != "win32" or not getattr(sys, "frozen", False):
         return
-    runtime = _resource_path("pythonnet/runtime/Python.Runtime.dll")
-    zone_marker = Path(f"{runtime}:Zone.Identifier")
-    try:
-        zone_marker.unlink(missing_ok=True)
-    except OSError as exc:
-        raise RuntimeError(
-            "Windows 阻止了桌面运行时。请右键发布 ZIP，打开“属性”，"
-            "勾选“解除锁定”后重新解压。"
-        ) from exc
+    for runtime_file in _resource_path("").rglob("*.dll"):
+        zone_marker = Path(f"{runtime_file}:Zone.Identifier")
+        try:
+            zone_marker.unlink(missing_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                "Windows 阻止了桌面运行时。请右键发布 ZIP，打开“属性”，"
+                "勾选“解除锁定”后重新解压。"
+            ) from exc
 
 
 def _available_port() -> int:
@@ -298,7 +298,7 @@ def _wait_for_server(server: object, thread: threading.Thread, timeout: float = 
 
 def run_desktop() -> None:
     _configure_packaged_data_dir()
-    _unblock_packaged_pythonnet_runtime()
+    _unblock_packaged_runtime_files()
 
     try:
         import uvicorn
