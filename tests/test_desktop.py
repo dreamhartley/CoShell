@@ -168,3 +168,21 @@ def test_packaged_data_dir_respects_explicit_override(monkeypatch, tmp_path):
     desktop._configure_packaged_data_dir()
 
     assert Path(os.environ["WEBSSH_DATA_DIR"]) == override
+
+
+def test_packaged_pythonnet_runtime_is_unblocked_before_gui_import(monkeypatch, tmp_path):
+    import app.desktop as desktop
+
+    runtime = tmp_path / "pythonnet" / "runtime" / "Python.Runtime.dll"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_bytes(b"runtime")
+    zone_marker = Path(f"{runtime}:Zone.Identifier")
+    zone_marker.write_text("[ZoneTransfer]\nZoneId=3\n", encoding="utf-8")
+    monkeypatch.setattr(desktop.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(desktop.sys, "platform", "win32")
+    monkeypatch.setattr(desktop, "_resource_path", lambda relative: tmp_path / relative)
+
+    desktop._unblock_packaged_pythonnet_runtime()
+
+    assert runtime.read_bytes() == b"runtime"
+    assert not zone_marker.exists()
