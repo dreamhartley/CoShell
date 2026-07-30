@@ -722,6 +722,9 @@ async def agent_chat(body: AgentChatBody):
             command_approver=agent_command_approver(body.session_id, body.permission_mode, approval_scope="terminal"),
             builtin_web_search=bool(config.get("builtin_web_search", 1)),
             mcp_tools=enabled_mcp_tools(), mcp_executor=execute_mcp_tool,
+            local_executor=lambda tool_name, arguments: agent_workspace.execute(body.session_id, tool_name, arguments),
+            local_tool_names={"initialize_host_workspace"},
+            workspace_instructions=agent_workspace.agent_instructions(body.session_id),
             system_prompt=QUICK_FIX_SYSTEM_PROMPT, max_rounds=12,
         )
     except KeyError as exc:
@@ -771,6 +774,7 @@ async def agent_chat_stream(body: AgentChatBody):
                     builtin_web_search=bool(config.get("builtin_web_search", 1)),
                     mcp_tools=tools, mcp_executor=execute_mcp_tool,
                     local_executor=agent_workspace_executor(body.session_id, emit, cancel_event),
+                    workspace_instructions=agent_workspace.agent_instructions(body.session_id),
                     command_approver=agent_command_approver(body.session_id, body.permission_mode, emit, cancel_event),
                     on_event=emit, stream_response=True, cancel_event=cancel_event,
                 )
@@ -861,7 +865,10 @@ async def terminal_agent_stream(body: TerminalAgentBody):
                 result = terminal_agents.chat(
                     body.session_id, message, config["api_url"], key, config["model"], execute,
                     builtin_web_search=bool(config.get("builtin_web_search", 1)),
+                    local_executor=agent_workspace_executor(body.session_id, emit, cancel_event),
+                    local_tool_names={"initialize_host_workspace"},
                     command_approver=agent_command_approver(body.session_id, body.permission_mode, emit, cancel_event, "terminal"),
+                    workspace_instructions=agent_workspace.agent_instructions(body.session_id),
                     on_event=emit, stream_response=True, system_prompt=QUICK_FIX_SYSTEM_PROMPT,
                     max_rounds=12, cancel_event=cancel_event,
                 )

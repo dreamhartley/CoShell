@@ -18,7 +18,7 @@ from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_comm
 from app.schemas import SSHKeyGenerateBody, ServerBody, ShortcutBody
 from app import main as main_app
 from app.main import agent_message_with_terminal_context, agent_workspace_executor, agents, terminal_agents
-from app.agent_workspace import AgentWorkspace
+from app.agent_workspace import AgentWorkspace, MANAGED_END, MANAGED_START
 from app.searxng_backend import _write_settings
 from app.mcp import normalize_mcp_url, search_tools
 from app.device_secrets import protect as protect_device_secret, unprotect as unprotect_device_secret
@@ -333,6 +333,81 @@ def test_agent_workspace_is_isolated_per_server_and_can_be_deleted(tmp_path):
     assert workspace.delete_server_workspace(1)
     assert not (tmp_path / "workspace" / "server-1").exists()
     assert (tmp_path / "workspace" / "server-2" / "same.txt").is_file()
+
+
+def test_host_workspace_initialization_creates_and_refreshes_agents_md_without_overwriting_user_content(tmp_path):
+    outputs = iter([
+        """__COSHELL_HOSTNAME__
+node-one.example.test
+__COSHELL_OS__
+PRETTY_NAME="Ubuntu 24.04 LTS"
+__COSHELL_KERNEL__
+Linux 6.8.0 x86_64
+__COSHELL_IDENTITY__
+user=deploy
+home=/home/deploy
+shell=/bin/bash
+__COSHELL_SERVICES__
+nginx.service loaded active running nginx
+__COSHELL_CONTAINERS__
+api\tacme/api:1\tUp 2 hours\t0.0.0.0:8080->8080/tcp
+__COSHELL_PORTS__
+tcp LISTEN 0 511 0.0.0.0:80
+""",
+        """__COSHELL_HOSTNAME__
+node-one.example.test
+__COSHELL_OS__
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+__COSHELL_KERNEL__
+Linux 6.8.1 x86_64
+__COSHELL_IDENTITY__
+user=deploy
+home=/home/deploy
+shell=/bin/bash
+__COSHELL_SERVICES__
+nginx.service loaded active running nginx
+app.service loaded active running app
+__COSHELL_CONTAINERS__
+__COSHELL_PORTS__
+tcp LISTEN 0 511 0.0.0.0:443
+""",
+    ])
+
+    class RemoteBytes:
+        def __init__(self, value):
+            self.value = value.encode()
+
+        def read(self, size=-1):
+            return self.value if size < 0 else self.value[:size]
+
+    class FakeClient:
+        def exec_command(self, command, timeout):
+            assert "__COSHELL_" in command and timeout == 20
+            return None, RemoteBytes(next(outputs)), RemoteBytes("")
+
+    session = SimpleNamespace(
+        sftp=MemorySftp(), server_id=42, host="203.0.113.8", port=22,
+        username="deploy", client=FakeClient(),
+    )
+    workspace = AgentWorkspace(tmp_path / "workspace", lambda _session_id: session)
+
+    created = workspace.execute("ssh-1", "initialize_host_workspace", {})
+    path = tmp_path / "workspace" / "server-42" / "AGENTS.md"
+    first = path.read_text(encoding="utf-8")
+    assert created["created"] is True and created["updated"] is False
+    assert created["service_count"] == 1 and created["container_count"] == 1
+    assert "Ubuntu 24.04 LTS" in first and "nginx.service" in first
+    assert first.count(MANAGED_START) == 1 and first.count(MANAGED_END) == 1
+
+    path.write_text(first + "\n本机用于生产 API，禁止直接重启数据库。\n", encoding="utf-8")
+    refreshed = workspace.execute("ssh-1", "initialize_host_workspace", {})
+    second = path.read_text(encoding="utf-8")
+    assert refreshed["created"] is False and refreshed["updated"] is True
+    assert refreshed["service_count"] == 2 and refreshed["container_count"] == 0
+    assert "Ubuntu 24.04.1 LTS" in second and "app.service" in second
+    assert "本机用于生产 API，禁止直接重启数据库。" in second
+    assert second.count(MANAGED_START) == 1 and second.count(MANAGED_END) == 1
+    assert workspace.agent_instructions("ssh-1") == second
 
 
 def test_agent_workspace_root_tools_share_and_persist_files_across_servers(tmp_path):
@@ -686,13 +761,16 @@ def test_agent_prompt_includes_local_date_and_workspace_tools(monkeypatch):
     result = AgentRegistry().chat(
         "ssh-local", "查看本地工作区", "https://example.test/v1", "key", "model", lambda *_args: {},
         local_executor=local_executor, on_event=events.append,
+        workspace_instructions="# 主机约定\n本机用于生产 API，禁止重启数据库。",
     )
     names = {tool["function"]["name"] for tool in payloads[0]["tools"]}
     assert names >= {
         "workspace_list", "workspace_read", "workspace_write", "sftp_transfer",
+        "initialize_host_workspace",
         "workspace_root_list", "workspace_root_read", "workspace_root_write", "workspace_root_sftp_transfer",
     }
     assert "只有当用户在当前消息中明确要求访问共享 workspace 根目录" in payloads[0]["messages"][0]["content"]
+    assert "本机用于生产 API，禁止重启数据库。" in payloads[0]["messages"][0]["content"]
     assert datetime.now().astimezone().date().isoformat() in payloads[0]["messages"][0]["content"]
     assert local_calls == [("workspace_list", {"path": "."})]
     assert result["steps"] == [{"tool": "workspace_list", "path": "."}]
@@ -700,6 +778,37 @@ def test_agent_prompt_includes_local_date_and_workspace_tools(monkeypatch):
         {"type": "local_tool_start", "id": "local-1", "tool": "workspace_list", "label": ".", "direction": None},
         {"type": "local_tool_end", "id": "local-1", "tool": "workspace_list", "label": ".", "direction": None, "success": True, "size": None, "entry_count": 0},
     ]
+
+
+def test_agent_can_expose_only_host_initialization_local_tool(monkeypatch):
+    replies = iter([
+        {"choices": [{"message": {"content": "", "tool_calls": [{
+            "id": "init-1", "type": "function",
+            "function": {"name": "initialize_host_workspace", "arguments": "{}"},
+        }]}}]},
+        {"choices": [{"message": {"content": "主机工作环境已初始化。"}}]},
+    ])
+    payloads = []
+    local_calls = []
+
+    def fake_request(*_args, **kwargs):
+        payloads.append(kwargs["payload"])
+        return next(replies)
+
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    result = AgentRegistry().chat(
+        "ssh-init", "初始化主机", "https://example.test/v1", "key", "model", lambda *_args: {},
+        local_executor=lambda tool, arguments: (
+            local_calls.append((tool, arguments))
+            or {"path": "AGENTS.md", "created": True, "size": 1024}
+        ),
+        local_tool_names={"initialize_host_workspace"},
+    )
+    names = {tool["function"]["name"] for tool in payloads[0]["tools"]}
+    assert "initialize_host_workspace" in names
+    assert "workspace_write" not in names and "sftp_transfer" not in names
+    assert local_calls == [("initialize_host_workspace", {})]
+    assert result["steps"] == [{"tool": "initialize_host_workspace", "path": "AGENTS.md", "size": 1024}]
 
 
 def test_web_search_uses_bundled_searxng_json(monkeypatch):
