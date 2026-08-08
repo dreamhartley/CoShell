@@ -529,7 +529,7 @@ def web_fetch(url: str) -> dict[str, Any]:
         "Accept": "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.1",
         "Accept-Encoding": "identity",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-        "User-Agent": "Mozilla/5.0 (compatible; SSH-Terminal-Agent/1.0; +web-fetch)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     })
     opener = urllib.request.build_opener(_SafeRedirectHandler())
     try:
@@ -649,6 +649,8 @@ class AgentRegistry:
                     "model": model, "messages": messages, "tools": available_tools, "tool_choice": "auto", "temperature": 0.2,
                 }
                 request_payload.update(model_request_options(model))
+                # DeepSeek 思考模式与 tool_choice 组合会触发上游 400
+                # ("reasoning_content in the thinking mode must be passed back"),保持默认 auto 即可。
                 if "deepseek" in model.lower():
                     request_payload.pop("tool_choice", None)
                 if stream_response and on_event:
