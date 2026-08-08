@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .ssh import SSHSession, clean_remote_path
+from .ssh import SFTP_STREAM_TIMEOUT, SSHSession, clean_remote_path, sftp_timeout
 
 
 MAX_WORKSPACE_TEXT = 256 * 1024
@@ -357,36 +357,43 @@ class AgentWorkspace:
         size = local.stat().st_size
         if size > MAX_SFTP_TRANSFER:
             raise ValueError("Agent SFTP 单个文件不能超过 512 MiB")
-        sftp = self.session_getter(session_id).sftp
-        if not overwrite:
-            try:
-                sftp.lstat(remote)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FileExistsError("远端文件已存在；确认后可设置 overwrite=true")
+        session = self.session_getter(session_id)
         directory, name = posixpath.dirname(remote) or ".", posixpath.basename(remote)
         if not name or name in (".", ".."):
             raise ValueError("远端目标必须是完整文件路径")
         temporary = posixpath.join(directory, f".{name}.agent-{secrets.token_hex(6)}.tmp")
         try:
-            with local.open("rb") as source, sftp.open(temporary, "wb") as destination:
-                if hasattr(destination, "set_pipelined"):
-                    destination.set_pipelined(True)
-                while chunk := source.read(TRANSFER_CHUNK):
-                    destination.write(chunk)
-            try:
-                sftp.posix_rename(temporary, remote)
-            except (AttributeError, OSError):
-                if overwrite:
+            # The SFTP channel is shared with the file panel; paramiko clients
+            # are not thread-safe, so transfers must hold the session lock and
+            # run with the stream timeout (slow links must not trip the
+            # quick-op bound and corrupt the channel).
+            with session.sftp_lock, sftp_timeout(session, SFTP_STREAM_TIMEOUT):
+                sftp = session.sftp
+                if not overwrite:
                     try:
-                        sftp.remove(remote)
+                        sftp.lstat(remote)
                     except FileNotFoundError:
                         pass
-                sftp.rename(temporary, remote)
+                    else:
+                        raise FileExistsError("远端文件已存在；确认后可设置 overwrite=true")
+                with local.open("rb") as source, sftp.open(temporary, "wb") as destination:
+                    if hasattr(destination, "set_pipelined"):
+                        destination.set_pipelined(True)
+                    while chunk := source.read(TRANSFER_CHUNK):
+                        destination.write(chunk)
+                try:
+                    sftp.posix_rename(temporary, remote)
+                except (AttributeError, OSError):
+                    if overwrite:
+                        try:
+                            sftp.remove(remote)
+                        except FileNotFoundError:
+                            pass
+                    sftp.rename(temporary, remote)
         except Exception:
             try:
-                sftp.remove(temporary)
+                with session.sftp_lock:
+                    session.sftp.remove(temporary)
             except OSError:
                 pass
             raise
@@ -399,22 +406,26 @@ class AgentWorkspace:
             raise FileExistsError("本地文件已存在；确认后可设置 overwrite=true")
         if local.exists() and not local.is_file():
             raise IsADirectoryError(f"本地目标不是文件：{self._relative(local, root)}")
-        sftp = self.session_getter(session_id).sftp
-        info = sftp.stat(remote)
-        if stat.S_ISDIR(info.st_mode):
-            raise IsADirectoryError("Agent SFTP 暂不支持传输目录")
-        if info.st_size > MAX_SFTP_TRANSFER:
-            raise ValueError("Agent SFTP 单个文件不能超过 512 MiB")
+        session = self.session_getter(session_id)
         local.parent.mkdir(parents=True, exist_ok=True)
         temporary = local.with_name(f".{local.name}.agent-{secrets.token_hex(6)}.tmp")
         written = 0
         try:
-            with sftp.open(remote, "rb") as source, temporary.open("xb") as destination:
-                while chunk := source.read(TRANSFER_CHUNK):
-                    destination.write(chunk)
-                    written += len(chunk)
-                    if written > MAX_SFTP_TRANSFER:
-                        raise ValueError("Agent SFTP 单个文件不能超过 512 MiB")
+            # See _upload: the transfer must hold the per-session SFTP lock and
+            # run with the stream timeout.
+            with session.sftp_lock, sftp_timeout(session, SFTP_STREAM_TIMEOUT):
+                sftp = session.sftp
+                info = sftp.stat(remote)
+                if stat.S_ISDIR(info.st_mode):
+                    raise IsADirectoryError("Agent SFTP 暂不支持传输目录")
+                if info.st_size > MAX_SFTP_TRANSFER:
+                    raise ValueError("Agent SFTP 单个文件不能超过 512 MiB")
+                with sftp.open(remote, "rb") as source, temporary.open("xb") as destination:
+                    while chunk := source.read(TRANSFER_CHUNK):
+                        destination.write(chunk)
+                        written += len(chunk)
+                        if written > MAX_SFTP_TRANSFER:
+                            raise ValueError("Agent SFTP 单个文件不能超过 512 MiB")
             if overwrite:
                 os.replace(temporary, local)
             else:

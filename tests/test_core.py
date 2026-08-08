@@ -9,6 +9,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.database import Database
 from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path, create_ssh_key_pair, normalize_remote_os, parse_private_key, save_ssh_key_pair
@@ -275,12 +276,18 @@ class MemorySftpFile(io.BytesIO):
 class MemorySftp:
     def __init__(self):
         self.files = {"/remote/source.bin": b"download-data"}
+        self.modes = {}
+        # 模拟 paramiko SFTPClient.sock（通道）的超时接口，sftp_timeout 依赖它
+        self.sock = SimpleNamespace(timeout=60, gettimeout=lambda: self.sock.timeout, settimeout=lambda value: setattr(self.sock, "timeout", value))
     def lstat(self, path):
         if path not in self.files: raise FileNotFoundError(path)
         return self.stat(path)
     def stat(self, path):
         if path not in self.files: raise FileNotFoundError(path)
-        return SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_size=len(self.files[path]))
+        return SimpleNamespace(st_mode=self.modes.get(path, stat.S_IFREG | 0o644), st_size=len(self.files[path]))
+    def chmod(self, path, mode):
+        if path not in self.files: raise FileNotFoundError(path)
+        self.modes[path] = (self.stat(path).st_mode & ~0o7777) | (mode & 0o7777)
     def open(self, path, mode):
         if mode == "rb":
             if path not in self.files: raise FileNotFoundError(path)
@@ -295,9 +302,45 @@ class MemorySftp:
         del self.files[path]
 
 
+def test_sftp_download_route_head_precheck_and_stream(monkeypatch):
+    sftp = MemorySftp()
+    monkeypatch.setattr(main_app.sessions, "get", lambda _session_id: SimpleNamespace(sftp=sftp, sftp_lock=threading.RLock()))
+    client = TestClient(main_app.app)
+    url = "/api/sftp/download?session_id=s-1&path=/remote/source.bin"
+
+    head = client.head(url)
+    assert head.status_code == 200 and head.content == b""
+    assert 'attachment; filename="source.bin"' in head.headers["content-disposition"]
+
+    stream = client.get(url)
+    assert stream.status_code == 200 and stream.content == b"download-data"
+
+    # 不存在的文件在预检阶段即报错，而不是下载时静默失败
+    missing = client.head("/api/sftp/download?session_id=s-1&path=/missing")
+    assert missing.status_code == 400
+
+
+def test_sftp_chmod_route_applies_mode(monkeypatch):
+    sftp = MemorySftp()
+    monkeypatch.setattr(main_app.sessions, "get", lambda _session_id: SimpleNamespace(sftp=sftp, sftp_lock=threading.RLock()))
+    client = TestClient(main_app.app)
+
+    response = client.post("/api/sftp/chmod", json={"session_id": "s-1", "path": "/remote/source.bin", "mode": 0o600})
+    assert response.status_code == 200 and response.json() == {"ok": True}
+    assert sftp.stat("/remote/source.bin").st_mode & 0o7777 == 0o600
+
+    # 不存在的路径返回 400
+    response = client.post("/api/sftp/chmod", json={"session_id": "s-1", "path": "/missing", "mode": 0o644})
+    assert response.status_code == 400
+
+    # 越界的权限值被 pydantic 拒绝
+    response = client.post("/api/sftp/chmod", json={"session_id": "s-1", "path": "/remote/source.bin", "mode": 0o10000})
+    assert response.status_code == 422
+
+
 def test_agent_workspace_is_sandboxed_and_supports_sftp(tmp_path):
     sftp = MemorySftp()
-    session = SimpleNamespace(sftp=sftp, server_id=7, host="example.test", port=22, username="root")
+    session = SimpleNamespace(sftp=sftp, server_id=7, host="example.test", port=22, username="root", sftp_lock=threading.RLock())
     workspace = AgentWorkspace(tmp_path / "workspace", lambda _session_id: session)
     written = workspace.write("notes/info.txt", "hello", False)
     assert written["path"] == "notes/info.txt"
@@ -319,8 +362,8 @@ def test_agent_workspace_is_sandboxed_and_supports_sftp(tmp_path):
 
 def test_agent_workspace_is_isolated_per_server_and_can_be_deleted(tmp_path):
     sessions = {
-        "one": SimpleNamespace(sftp=MemorySftp(), server_id=1, host="one.test", port=22, username="root"),
-        "two": SimpleNamespace(sftp=MemorySftp(), server_id=2, host="two.test", port=22, username="root"),
+        "one": SimpleNamespace(sftp=MemorySftp(), server_id=1, host="one.test", port=22, username="root", sftp_lock=threading.RLock()),
+        "two": SimpleNamespace(sftp=MemorySftp(), server_id=2, host="two.test", port=22, username="root", sftp_lock=threading.RLock()),
     }
     workspace = AgentWorkspace(tmp_path / "workspace", sessions.__getitem__)
 
@@ -387,7 +430,7 @@ tcp LISTEN 0 511 0.0.0.0:443
 
     session = SimpleNamespace(
         sftp=MemorySftp(), server_id=42, host="203.0.113.8", port=22,
-        username="deploy", client=FakeClient(),
+        username="deploy", client=FakeClient(), sftp_lock=threading.RLock(),
     )
     workspace = AgentWorkspace(tmp_path / "workspace", lambda _session_id: session)
 
@@ -412,8 +455,8 @@ tcp LISTEN 0 511 0.0.0.0:443
 
 def test_agent_workspace_root_tools_share_and_persist_files_across_servers(tmp_path):
     sessions = {
-        "one": SimpleNamespace(sftp=MemorySftp(), server_id=1, host="one.test", port=22, username="root"),
-        "two": SimpleNamespace(sftp=MemorySftp(), server_id=2, host="two.test", port=22, username="root"),
+        "one": SimpleNamespace(sftp=MemorySftp(), server_id=1, host="one.test", port=22, username="root", sftp_lock=threading.RLock()),
+        "two": SimpleNamespace(sftp=MemorySftp(), server_id=2, host="two.test", port=22, username="root", sftp_lock=threading.RLock()),
     }
     workspace = AgentWorkspace(tmp_path / "workspace", sessions.__getitem__)
 

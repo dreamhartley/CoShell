@@ -278,6 +278,24 @@
       <footer class="editor-status"><span id="file-editor-path"></span><span id="file-editor-position">Ln 1, Col 1</span><span id="file-editor-state">UTF-8</span></footer>
     </div>
   </dialog>
+  <dialog id="chmod-dialog" aria-labelledby="chmod-title">
+    <form id="chmod-form" class="dialog-form" autocomplete="off">
+      <div class="dialog-title"><h2 id="chmod-title">修改权限</h2><button type="button" class="dialog-close icon-btn">×</button></div>
+      <p id="chmod-path" class="chmod-path muted"></p>
+      <div id="chmod-grid" class="chmod-grid"></div>
+      <div class="chmod-footer">
+        <label class="chmod-numeric">数字模式 <input id="chmod-mode" inputmode="numeric" maxlength="4" autocomplete="off"></label>
+        <div class="chmod-presets">
+          <button type="button" data-mode="644">644</button>
+          <button type="button" data-mode="755">755</button>
+          <button type="button" data-mode="600">600</button>
+          <button type="button" data-mode="700">700</button>
+          <button type="button" data-mode="777">777</button>
+        </div>
+      </div>
+      <div class="dialog-actions"><button type="button" class="dialog-close">取消</button><button id="chmod-submit" class="primary" type="submit">应用</button></div>
+    </form>
+  </dialog>
   <dialog id="app-prompt-dialog" class="app-prompt-dialog" aria-labelledby="app-prompt-title">
     <form id="app-prompt-form" class="dialog-form" autocomplete="off">
       <div class="dialog-title"><h2 id="app-prompt-title">请确认</h2><button id="app-prompt-close" type="button" class="icon-btn" aria-label="关闭">×</button></div>

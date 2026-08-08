@@ -9,15 +9,26 @@ import socket
 import stat
 import threading
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import paramiko
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 
 from .database import Database
+
+
+# Bounded wait for one SFTP round trip. A stalled server should surface an
+# error (and let the session be torn down) instead of hanging the file panel
+# and exhausting the thread pool forever.
+SFTP_OP_TIMEOUT = 60
+# Long transfers (download/upload/agent) tolerate much longer stalls between
+# packets: the channel timeout is a no-data detector, and firing it mid-packet
+# corrupts the SFTP response stream, so slow-but-alive links must never hit it.
+SFTP_STREAM_TIMEOUT = 600
 
 
 class HostKeyRequired(Exception):
@@ -123,6 +134,10 @@ class SSHSession:
     port: int
     username: str
     server_id: int | None = None
+    # Paramiko's SFTPClient is not thread-safe: two concurrent synchronous
+    # requests on one channel can consume each other's responses and hang
+    # forever. Every SFTP operation on this session must run under this lock.
+    sftp_lock: threading.RLock = field(default_factory=threading.RLock)
 
     def close(self) -> None:
         for item in (self.sftp, self.channel, self.client):
@@ -208,6 +223,7 @@ class SessionRegistry:
             transport.set_keepalive(30)
             channel = client.invoke_shell(term="xterm-256color", width=int(data.get("cols", 100)), height=int(data.get("rows", 30)))
             sftp = client.open_sftp()
+            sftp.sock.settimeout(SFTP_OP_TIMEOUT)
             server_id = int(data["server_id"]) if data.get("server_id") is not None else None
             session = SSHSession(secrets.token_urlsafe(24), client, channel, sftp, host, port, username, server_id)
             with self._lock:
@@ -239,6 +255,32 @@ class SessionRegistry:
             items, self._items = list(self._items.values()), {}
         for item in items:
             item.close()
+
+
+@contextmanager
+def sftp_timeout(session: SSHSession, timeout: float | None) -> Iterator[None]:
+    """Temporarily bound socket reads on the session's SFTP channel.
+
+    The channel timeout is a no-data detector; firing it in the middle of a
+    packet corrupts the SFTP response stream, so long transfers run with a much
+    longer bound than quick control-plane ops. Must be used under the session's
+    sftp_lock (it mutates shared channel state).
+    """
+    channel = session.sftp.sock
+    previous = channel.gettimeout()
+    if timeout != previous:
+        channel.settimeout(timeout)
+    try:
+        yield
+    finally:
+        if timeout != previous:
+            channel.settimeout(previous)
+
+
+def with_sftp_lock(session: SSHSession, fn: Callable[..., Any], *args: Any, timeout: float | None = SFTP_OP_TIMEOUT, **kwargs: Any) -> Any:
+    """Run a callable under the session's SFTP lock (for asyncio.to_thread)."""
+    with session.sftp_lock, sftp_timeout(session, timeout):
+        return fn(*args, **kwargs)
 
 
 @dataclass
@@ -312,6 +354,14 @@ class UploadRegistry:
             if remover:
                 try: remover.remove(item.path)
                 except Exception: pass
+
+    def session_id_of(self, upload_id: str) -> str:
+        """Map an upload id back to its SSH session (404 for expired tasks)."""
+        with self._lock:
+            item = self._items.get(upload_id)
+        if not item:
+            raise KeyError("上传任务不存在或已过期")
+        return item.ssh_session_id
 
     def close_for_session(self, ssh_session_id: str) -> None:
         with self._lock:

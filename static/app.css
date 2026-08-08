@@ -95,3 +95,32 @@ dialog::backdrop{background:#1b10238f;backdrop-filter:blur(4px)}
 /* Keep longer, time-aware welcome copy calm and readable at every window size. */
 .welcome{padding:24px;text-align:center}
 .welcome p{width:min(680px,100%);min-height:1.45em;line-height:1.65;overflow-wrap:anywhere}
+
+/* --- SFTP 行内重命名 --- */
+.file-row.editing{outline:1px solid var(--accent);outline-offset:-1px}
+.rename-editor{display:flex;align-items:center;gap:6px;min-width:0}
+.rename-editor input{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--accent);border-radius:6px;padding:4px 7px;color:var(--text);font:inherit}
+.rename-editor button{width:26px;height:26px;flex:none;display:grid;place-items:center;padding:0;border:1px solid var(--border);border-radius:6px;background:var(--panel2);font-size:14px;line-height:1}
+.rename-editor button:hover:not(:disabled){border-color:var(--accent);background:var(--hover)}
+.rename-editor button:disabled{cursor:not-allowed;opacity:.45}
+.rename-confirm{color:var(--good)}
+.rename-cancel{color:var(--danger)}
+
+/* --- 修改权限对话框 --- */
+.chmod-path{word-break:break-all;margin-bottom:6px}
+.chmod-grid{display:flex;flex-direction:column;gap:8px;margin:4px 0 12px}
+.chmod-row{display:grid;grid-template-columns:52px repeat(3,1fr);gap:6px;align-items:center}
+.chmod-role{color:var(--muted);font-size:13px}
+.chmod-bit{display:flex;align-items:center;justify-content:center;gap:5px;padding:6px;border:1px solid var(--border);border-radius:7px;cursor:pointer;user-select:none;color:var(--muted);font-size:13px}
+.chmod-bit:hover{border-color:var(--accent)}
+.chmod-bit.checked{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--text)}
+.chmod-bit input{width:auto;margin:0;accent-color:var(--accent)}
+.chmod-footer{display:flex;align-items:center;gap:10px}
+.chmod-numeric{display:flex;flex-direction:row;align-items:center;gap:6px;margin:0;color:var(--muted);font-size:13px}
+.chmod-numeric input{width:64px;margin:0;padding:6px 8px;font-family:ui-monospace,monospace}
+.chmod-presets{display:flex;gap:5px;margin-left:auto}
+.chmod-presets button{padding:4px 9px;font-size:12px;border-radius:6px}
+
+/* --- SFTP 行内新建 --- */
+.file-row.create-row{outline:1px dashed var(--accent);outline-offset:-1px}
+.rename-editor input::placeholder{color:var(--muted);opacity:.85}

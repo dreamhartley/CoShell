@@ -13,14 +13,14 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
 import paramiko
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, list_models
@@ -30,9 +30,9 @@ from .backup import BackupError, MAX_BACKUP_BYTES, create_backup, parse_backup, 
 from .database import Database
 from .device_secrets import DeviceSecretError, protect as protect_device_secret, unprotect as unprotect_device_secret
 from .mcp import MCPError, call_tool as call_mcp_tool, list_tools as list_mcp_tools, search_tools
-from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
+from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, ChmodBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
 from .searxng_backend import SearxNGService
-from .ssh import HostKeyRequired, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair
+from .ssh import SFTP_OP_TIMEOUT, SFTP_STREAM_TIMEOUT, HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair, sftp_timeout, with_sftp_lock
 from .updater import application_info
 from .vault import Vault, VaultError
 
@@ -897,11 +897,48 @@ async def terminal_agent_stream(body: TerminalAgentBody):
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
-def sftp_for(session_id: str):
+def sftp_for(session_id: str) -> SSHSession:
     try:
-        return sessions.get(session_id).sftp
+        return sessions.get(session_id)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+def drop_session(session: SSHSession) -> None:
+    """Tear down a session whose transport an auxiliary operation found dead.
+
+    SFTP is usually the first subsystem to observe a dropped transport; closing
+    the session unblocks every pending request so callers fail fast with 410
+    instead of hanging.
+    """
+    uploads.close_for_session(session.id)
+    agents.clear(session.id)
+    terminal_agents.clear(session.id)
+    sessions.close(session.id)
+
+
+@contextmanager
+def sftp_guard(session_id: str, timeout: float | None = SFTP_OP_TIMEOUT) -> Iterator[paramiko.SFTPClient]:
+    """Resolve a session and run one SFTP operation under its channel lock.
+
+    Concurrent synchronous requests on a single paramiko SFTPClient are not
+    thread-safe: interleaved requests can consume each other's responses and
+    hang forever until the session is closed. Every route therefore serializes
+    on session.sftp_lock, and the socket timeout set at connect time bounds
+    the wait; a timeout or a dropped transport tears the session down so the
+    caller gets a clear 410 instead of an endless spinner. Long transfers pass
+    a stream timeout (SFTP_STREAM_TIMEOUT) so slow-but-alive links are not
+    killed by the quick-op bound.
+    """
+    session = sftp_for(session_id)
+    try:
+        with session.sftp_lock, sftp_timeout(session, timeout):
+            yield session.sftp
+    except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException) as exc:
+        # SFTPError ("Garbage packet received") means the response stream got
+        # misaligned (e.g. a timeout hit mid-packet) — the channel is unusable.
+        drop_session(session)
+        raise HTTPException(410, "SSH 会话已断开，请重新连接") from exc
 
 
 @app.get("/api/system-info")
@@ -946,13 +983,10 @@ def system_info(session_id: str):
         }
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
-    except (EOFError, paramiko.SSHException) as exc:
+    except (socket.timeout, EOFError, paramiko.SSHException) as exc:
         # An auxiliary channel can be the first operation to observe that the
         # server dropped a transport which was still cached as a live session.
-        uploads.close_for_session(session_id)
-        agents.clear(session_id)
-        terminal_agents.clear(session_id)
-        sessions.close(session_id)
+        drop_session(session)
         raise HTTPException(410, "SSH 会话已断开") from exc
     except (OSError, ValueError) as exc:
         raise HTTPException(400, f"无法读取远端系统信息：{exc}") from exc
@@ -960,11 +994,11 @@ def system_info(session_id: str):
 
 @app.get("/api/sftp/list")
 def sftp_list(session_id: str, path: str = "."):
-    sftp = sftp_for(session_id)
     path = clean_remote_path(path)
     try:
-        resolved = sftp.normalize(path)
-        items = [file_info(x) for x in sftp.listdir_attr(resolved)]
+        with sftp_guard(session_id) as sftp:
+            resolved = sftp.normalize(path)
+            items = [file_info(x) for x in sftp.listdir_attr(resolved)]
         items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
         return {"path": resolved, "items": items}
     except OSError as exc:
@@ -974,7 +1008,19 @@ def sftp_list(session_id: str, path: str = "."):
 @app.post("/api/sftp/mkdir")
 def sftp_mkdir(body: PathBody):
     try:
-        sftp_for(body.session_id).mkdir(clean_remote_path(body.path))
+        with sftp_guard(body.session_id) as sftp:
+            sftp.mkdir(clean_remote_path(body.path))
+        return {"ok": True}
+    except OSError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/sftp/chmod")
+def sftp_chmod(body: ChmodBody):
+    path = clean_remote_path(body.path)
+    try:
+        with sftp_guard(body.session_id) as sftp:
+            sftp.chmod(path, body.mode & 0o7777)
         return {"ok": True}
     except OSError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -983,11 +1029,11 @@ def sftp_mkdir(body: PathBody):
 @app.post("/api/sftp/delete")
 def sftp_delete(body: PathBody):
     try:
-        sftp = sftp_for(body.session_id)
-        target = sftp.normalize(clean_remote_path(body.path))
-        if target == "/":
-            raise HTTPException(400, "禁止递归删除远程根目录")
-        remove_recursive(sftp, target)
+        with sftp_guard(body.session_id) as sftp:
+            target = sftp.normalize(clean_remote_path(body.path))
+            if target == "/":
+                raise HTTPException(400, "禁止递归删除远程根目录")
+            remove_recursive(sftp, target)
         return {"ok": True}
     except HTTPException:
         raise
@@ -997,19 +1043,19 @@ def sftp_delete(body: PathBody):
 
 @app.post("/api/sftp/move")
 def sftp_move(body: TransferBody):
-    sftp = sftp_for(body.session_id)
     src, dst = clean_remote_path(body.source), clean_remote_path(body.destination)
     try:
-        if not body.overwrite:
-            try:
-                sftp.lstat(dst)
-                raise HTTPException(409, "目标已存在")
-            except FileNotFoundError:
-                pass
-        if body.overwrite:
-            try: remove_recursive(sftp, dst)
-            except OSError: pass
-        sftp.rename(src, dst)
+        with sftp_guard(body.session_id) as sftp:
+            if not body.overwrite:
+                try:
+                    sftp.lstat(dst)
+                    raise HTTPException(409, "目标已存在")
+                except FileNotFoundError:
+                    pass
+            if body.overwrite:
+                try: remove_recursive(sftp, dst)
+                except OSError: pass
+            sftp.rename(src, dst)
         return {"ok": True}
     except HTTPException:
         raise
@@ -1019,22 +1065,22 @@ def sftp_move(body: TransferBody):
 
 @app.post("/api/sftp/copy")
 def sftp_copy(body: TransferBody):
-    sftp = sftp_for(body.session_id)
     src, dst = clean_remote_path(body.source), clean_remote_path(body.destination)
     try:
-        source_info = sftp.lstat(src)
-        if stat.S_ISDIR(source_info.st_mode) and (dst == src or dst.startswith(src.rstrip("/") + "/")):
-            raise HTTPException(400, "不能将目录复制到其自身内部")
-        if not body.overwrite:
-            try:
-                sftp.lstat(dst)
-                raise HTTPException(409, "目标已存在")
-            except FileNotFoundError:
-                pass
-        if body.overwrite:
-            try: remove_recursive(sftp, dst)
-            except OSError: pass
-        copy_recursive(sftp, src, dst)
+        with sftp_guard(body.session_id) as sftp:
+            source_info = sftp.lstat(src)
+            if stat.S_ISDIR(source_info.st_mode) and (dst == src or dst.startswith(src.rstrip("/") + "/")):
+                raise HTTPException(400, "不能将目录复制到其自身内部")
+            if not body.overwrite:
+                try:
+                    sftp.lstat(dst)
+                    raise HTTPException(409, "目标已存在")
+                except FileNotFoundError:
+                    pass
+            if body.overwrite:
+                try: remove_recursive(sftp, dst)
+                except OSError: pass
+            copy_recursive(sftp, src, dst)
         return {"ok": True}
     except HTTPException:
         raise
@@ -1044,23 +1090,23 @@ def sftp_copy(body: TransferBody):
 
 @app.post("/api/sftp/upload")
 def sftp_upload(session_id: str = Form(...), path: str = Form(...), overwrite: bool = Form(False), file: UploadFile = File(...)):
-    sftp = sftp_for(session_id)
     safe_name = posixpath.basename((file.filename or "upload.bin").replace("\\", "/"))
     if not safe_name or safe_name in (".", ".."):
         raise HTTPException(400, "无效的文件名")
     target = clean_remote_path(posixpath.join(path, safe_name))
     try:
-        if not overwrite:
-            try:
-                sftp.stat(target)
-                raise HTTPException(409, "目标文件已存在")
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-        with sftp.open(target, "wb") as remote:
-            while chunk := file.file.read(1024 * 256):
-                remote.write(chunk)
+        with sftp_guard(session_id, timeout=SFTP_STREAM_TIMEOUT) as sftp:
+            if not overwrite:
+                try:
+                    sftp.stat(target)
+                    raise HTTPException(409, "目标文件已存在")
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            with sftp.open(target, "wb") as remote:
+                while chunk := file.file.read(1024 * 256):
+                    remote.write(chunk)
         return {"ok": True, "path": target}
     except HTTPException:
         raise
@@ -1079,7 +1125,8 @@ def upload_initialize(body: UploadInitBody):
         raise HTTPException(400, "无效的文件名")
     target = clean_remote_path(posixpath.join(body.path, safe_name))
     try:
-        item = uploads.create(body.session_id, session.sftp, target, body.size, body.overwrite)
+        with session.sftp_lock:
+            item = uploads.create(body.session_id, session.sftp, target, body.size, body.overwrite)
         return {"upload_id": item.id, "path": item.path, "written": 0}
     except FileExistsError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -1092,63 +1139,109 @@ async def upload_chunk(upload_id: str, request: Request, offset: int):
     chunk = await request.body()
     if len(chunk) > 4 * 1024 * 1024:
         raise HTTPException(413, "上传分块过大")
+    session = None
     try:
-        item = await asyncio.to_thread(uploads.write, upload_id, offset, chunk)
+        session = sessions.get(uploads.session_id_of(upload_id))
+        item = await asyncio.to_thread(with_sftp_lock, session, uploads.write, upload_id, offset, chunk, timeout=SFTP_STREAM_TIMEOUT)
         return {"written": item.written, "size": item.expected_size}
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException) as exc:
+        if session is not None:
+            drop_session(session)
+        raise HTTPException(410, "SSH 会话已断开，请重新连接") from exc
     except (OSError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/sftp/uploads/{upload_id}/finish")
 async def upload_finish(upload_id: str):
+    session = None
     try:
-        item = await asyncio.to_thread(uploads.finish, upload_id)
+        session = sessions.get(uploads.session_id_of(upload_id))
+        item = await asyncio.to_thread(with_sftp_lock, session, uploads.finish, upload_id, timeout=SFTP_STREAM_TIMEOUT)
         return {"ok": True, "path": item.path, "size": item.written}
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException) as exc:
+        if session is not None:
+            drop_session(session)
+        raise HTTPException(410, "SSH 会话已断开，请重新连接") from exc
     except (OSError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
 @app.delete("/api/sftp/uploads/{upload_id}")
 def upload_abort(upload_id: str):
-    uploads.abort(upload_id)
+    try:
+        session = sessions.get(uploads.session_id_of(upload_id))
+    except KeyError:
+        uploads.abort(upload_id)
+        return {"ok": True}
+    with session.sftp_lock:
+        uploads.abort(upload_id)
     return {"ok": True}
 
 
-@app.get("/api/sftp/download")
-def sftp_download(session_id: str, path: str):
-    sftp = sftp_for(session_id)
+@app.api_route("/api/sftp/download", methods=["GET", "HEAD"])
+def sftp_download(session_id: str, path: str, request: Request):
     path = clean_remote_path(path)
+    session = sftp_for(session_id)
     try:
-        remote = sftp.open(path, "rb")
+        with session.sftp_lock:
+            remote = session.sftp.open(path, "rb")
     except OSError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException) as exc:
+        drop_session(session)
+        raise HTTPException(410, "SSH 会话已断开，请重新连接") from exc
+    name = posixpath.basename(path).replace('"', "")
+    if request.method == "HEAD":
+        # 前端用 HEAD 预检下载可用性：只验证打开成功，不流式传输
+        with session.sftp_lock:
+            try:
+                remote.close()
+            except Exception:
+                pass
+        return Response(headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     def chunks() -> Iterator[bytes]:
+        # Lock per chunk (not for the whole stream) so browsing and other file
+        # operations keep working while a large download is in flight. Long
+        # transfers use the stream timeout: slow-but-alive links must not be
+        # killed by the quick-op bound.
         try:
-            while data := remote.read(1024 * 256):
+            while True:
+                with session.sftp_lock, sftp_timeout(session, SFTP_STREAM_TIMEOUT):
+                    data = remote.read(1024 * 256)
+                if not data:
+                    break
                 yield data
+        except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException):
+            drop_session(session)
+            raise
         finally:
-            remote.close()
-    name = posixpath.basename(path).replace('"', "")
+            with session.sftp_lock:
+                try:
+                    remote.close()
+                except Exception:
+                    pass
+
     return StreamingResponse(chunks(), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.get("/api/sftp/editor")
 def editor_read(session_id: str, path: str):
-    sftp = sftp_for(session_id)
     path = clean_remote_path(path)
     try:
-        info = sftp.stat(path)
-        if stat.S_ISDIR(info.st_mode):
-            raise HTTPException(400, "目录不能在文件编辑器中打开")
-        if info.st_size > 5 * 1024 * 1024:
-            raise HTTPException(413, "在线编辑器仅支持不超过 5 MiB 的文本文件")
-        with sftp.open(path, "rb") as remote:
-            data = remote.read()
+        with sftp_guard(session_id) as sftp:
+            info = sftp.stat(path)
+            if stat.S_ISDIR(info.st_mode):
+                raise HTTPException(400, "目录不能在文件编辑器中打开")
+            if info.st_size > 5 * 1024 * 1024:
+                raise HTTPException(413, "在线编辑器仅支持不超过 5 MiB 的文本文件")
+            with sftp.open(path, "rb") as remote:
+                data = remote.read()
         if b"\x00" in data:
             raise HTTPException(415, "检测到二进制内容，无法作为文本编辑")
         try:
@@ -1164,53 +1257,56 @@ def editor_read(session_id: str, path: str):
 
 @app.put("/api/sftp/editor")
 def editor_save(body: EditorSaveBody):
-    sftp = sftp_for(body.session_id)
     path = clean_remote_path(body.path)
     if "\x00" in body.content:
         raise HTTPException(400, "文本中不能包含 NUL 字符")
     temp_path = posixpath.join(posixpath.dirname(path), f".{posixpath.basename(path)}.webssh-{secrets.token_hex(6)}.tmp")
     try:
-        current = sftp.stat(path)
-        if body.expected_mtime is not None and int(current.st_mtime) != body.expected_mtime and not body.force:
-            raise HTTPException(409, "远端文件已被其他程序修改，请重新载入或确认覆盖")
-        data = body.content.encode("utf-8")
-        with sftp.open(temp_path, "wb") as remote:
-            remote.set_pipelined(True)
-            for offset in range(0, len(data), 256 * 1024):
-                remote.write(data[offset:offset + 256 * 1024])
-        sftp.chmod(temp_path, current.st_mode & 0o7777)
-        try:
-            sftp.posix_rename(temp_path, path)
-        except (AttributeError, OSError):
-            backup_path = path + f".webssh-backup-{secrets.token_hex(6)}"
-            sftp.rename(path, backup_path)
+        with sftp_guard(body.session_id, timeout=SFTP_STREAM_TIMEOUT) as sftp:
+            current = sftp.stat(path)
+            if body.expected_mtime is not None and int(current.st_mtime) != body.expected_mtime and not body.force:
+                raise HTTPException(409, "远端文件已被其他程序修改，请重新载入或确认覆盖")
+            data = body.content.encode("utf-8")
+            with sftp.open(temp_path, "wb") as remote:
+                remote.set_pipelined(True)
+                for offset in range(0, len(data), 256 * 1024):
+                    remote.write(data[offset:offset + 256 * 1024])
+            sftp.chmod(temp_path, current.st_mode & 0o7777)
             try:
-                sftp.rename(temp_path, path)
-            except OSError:
-                sftp.rename(backup_path, path)
-                raise
-            try: sftp.remove(backup_path)
-            except OSError: pass
-        saved = sftp.stat(path)
+                sftp.posix_rename(temp_path, path)
+            except (AttributeError, OSError):
+                backup_path = path + f".webssh-backup-{secrets.token_hex(6)}"
+                sftp.rename(path, backup_path)
+                try:
+                    sftp.rename(temp_path, path)
+                except OSError:
+                    sftp.rename(backup_path, path)
+                    raise
+                try: sftp.remove(backup_path)
+                except OSError: pass
+            saved = sftp.stat(path)
         return {"ok": True, "mtime": int(saved.st_mtime), "size": saved.st_size}
     except HTTPException:
         raise
     except OSError as exc:
-        try: sftp.remove(temp_path)
-        except OSError: pass
+        try:
+            with sftp_guard(body.session_id) as sftp:
+                sftp.remove(temp_path)
+        except Exception:
+            pass
         raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/sftp/file")
 def create_empty_file(body: PathBody):
-    sftp = sftp_for(body.session_id)
     path = clean_remote_path(body.path)
     name = posixpath.basename(path)
     if not name or name in (".", ".."):
         raise HTTPException(400, "无效的文件名")
     try:
-        with sftp.open(path, "x"):
-            pass
+        with sftp_guard(body.session_id) as sftp:
+            with sftp.open(path, "x"):
+                pass
         return {"ok": True, "path": path}
     except OSError as exc:
         raise HTTPException(409 if "exist" in str(exc).lower() else 400, str(exc)) from exc

@@ -721,7 +721,17 @@ function shortcutEditorNewline(editor){const cursor=editor.getCursor(),before=ed
 function keepShortcutBlankClickInView(editor){editor.on('mousedown',(cm,event)=>{if(event.button!==0||event.altKey||event.ctrlKey||event.metaKey)return;const clicked=cm.coordsChar({left:event.clientX,top:event.clientY},'window');if(clicked.outside!==1)return;event.preventDefault();const line=cm.lastLine(),box=cm.charCoords({line,ch:0},'window'),target=cm.coordsChar({left:event.clientX,top:(box.top+box.bottom)/2},'window');cm.focus();event.shiftKey?cm.extendSelection(target):cm.setCursor(target)})}
 function openEditor(title,fields,submit){$('#editor-title').textContent=title;const root=$('#editor-fields'),dialog=$('#editor-dialog'),codeEditors=[];root.replaceChildren();dialog.classList.toggle('shortcut-editor-dialog',fields.some(field=>field[3]==='code'));fields.forEach(([name,label,value,type='text',options={}])=>{const l=document.createElement('label');const caption=document.createElement('span');caption.textContent=label;l.append(caption);let input;if(type==='textarea'||type==='code'){input=document.createElement('textarea');input.rows=type==='code'?10:6}else if(type==='select'){input=document.createElement('select');input.innerHTML='<option value="password">密码</option><option value="private_key">私钥</option>'}else if(type==='sshkey'){input=document.createElement('select');input.add(new Option('不使用密码库密钥',''));for(const key of state.sshKeys)input.add(new Option(`${key.name} · ${key.key_type}`,String(key.id)))}else{input=document.createElement('input');input.type=type}input.name=name;input.autocomplete=type==='password'?'new-password':'off';input.value=value??'';for(const [key,option] of Object.entries(options)){if(typeof option==='boolean')input[key]=option;else input.setAttribute(key,String(option))}if(type==='code')l.classList.add('shortcut-code-field');l.append(input);root.append(l);if(type==='code'){const cm=CodeMirror.fromTextArea(input,{mode:'shell',lineNumbers:true,indentUnit:2,tabSize:2,indentWithTabs:false,smartIndent:true,matchBrackets:true,styleActiveLine:true,lineWrapping:false,theme:themeModes[currentTheme()]==='dark'?'material-darker':'default',extraKeys:{Enter:shortcutEditorNewline,Tab:editor=>editor.somethingSelected()?editor.indentSelection('add'):editor.execCommand('insertSoftTab'),'Shift-Tab':editor=>editor.indentSelection('subtract')}});keepShortcutBlankClickInView(cm);codeEditors.push(cm)}});$('#editor-form').onsubmit=async e=>{e.preventDefault();codeEditors.forEach(cm=>cm.save());try{const data=Object.fromEntries(new FormData(e.target));if(codeEditors.length&&!String(data.command||'').trim())throw new Error('请输入命令或脚本');await submit(data);dialog.close();toast('已保存')}catch(err){toast(err.message,true)}};dialog.showModal();setTimeout(()=>{codeEditors.forEach(cm=>cm.refresh());(codeEditors[0]||$('input,textarea,select',root))?.focus()},30)}
 
-async function loadSftp(path){const tab=activeTab(),root=$('#file-list');if(!tab?.sessionId){root.innerHTML='<div class="empty">连接 SSH 后浏览文件</div>';return}path=path||$('#sftp-path').value||tab.last_path||'.';root.innerHTML='<div class="empty">正在加载…</div>';try{const data=await api(`/api/sftp/list?session_id=${encodeURIComponent(tab.sessionId)}&path=${encodeURIComponent(path)}`);tab.last_path=data.path;$('#sftp-path').value=data.path;saveTabs();renderFiles(data.items)}catch(err){root.innerHTML=`<div class="empty">${esc(err.message)}</div>`}}
+async function loadSftp(path){
+  const tab=activeTab(),root=$('#file-list');if(!tab?.sessionId){root.innerHTML='<div class="empty">连接 SSH 后浏览文件</div>';return}
+  path=path||$('#sftp-path').value||tab.last_path||'.';
+  // Rapid navigation (double-click, repeated 上一级) fires overlapping
+  // requests; keep only the latest one so an older response can never render
+  // a stale directory or overwrite last_path out of order.
+  const request=(tab.sftpRequestSeq=(tab.sftpRequestSeq||0)+1);
+  if(tab.sftpAbort)tab.sftpAbort.abort();
+  const controller=new AbortController();tab.sftpAbort=controller;
+  root.innerHTML='<div class="empty">正在加载…</div>';
+  try{const data=await api(`/api/sftp/list?session_id=${encodeURIComponent(tab.sessionId)}&path=${encodeURIComponent(path)}`,{signal:controller.signal});if(request!==tab.sftpRequestSeq||tab!==activeTab())return;tab.last_path=data.path;$('#sftp-path').value=data.path;saveTabs();renderFiles(data.items)}catch(err){if(request!==tab.sftpRequestSeq)return;root.innerHTML=`<div class="empty">${esc(err.message)}</div>`}}
 const sftpIconByExtension=Object.freeze({
   txt:'text',log:'text',rtf:'text',nfo:'text',
   conf:'config',cfg:'config',ini:'config',env:'config',properties:'config',editorconfig:'config',service:'config',desktop:'config',rc:'config',lock:'config',
@@ -774,7 +784,156 @@ function sftpFileIcon(name,isDir){
   return sftpIconByExtension[extension]||'default-file';
 }
 function sftpFileIconPath(item){return `/static/icons/files/${sftpFileIcon(item.name,item.is_dir)}.svg`}
-function renderFiles(items){const root=$('#file-list');root.replaceChildren();state.selectedFiles.clear();updateBatch();items.forEach(item=>{const row=document.createElement('div');row.className='file-row';row.innerHTML=`<input type="checkbox" aria-label="选择 ${esc(item.name)}"><img class="file-icon" src="${sftpFileIconPath(item)}" alt="" aria-hidden="true" draggable="false"><span class="file-name" title="${esc(item.name)}">${esc(item.name)}</span><span class="file-size">${item.is_dir?'':formatSize(item.size)}</span>`;const check=$('input',row);check.onchange=()=>{check.checked?state.selectedFiles.add(item):state.selectedFiles.delete(item);updateBatch()};row.ondblclick=e=>{if(e.target!==check)(item.is_dir?loadSftp(joinRemote(activeTab().last_path,item.name)):openFileEditor(joinRemote(activeTab().last_path,item.name)))};row.oncontextmenu=e=>showFileMenu(e,item);root.append(row)});const tab=activeTab();for(const task of state.uploadTasks.values())if(task.tabId===tab?.id&&task.directory===tab.last_path)renderUploadTask(task);if(!root.children.length)root.innerHTML='<div class="empty">空目录</div>'}
+function renderFiles(items){const root=$('#file-list');root.replaceChildren();state.selectedFiles.clear();updateBatch();items.forEach(item=>{const row=document.createElement('div');row.className='file-row';row.innerHTML=`<input type="checkbox" aria-label="选择 ${esc(item.name)}"><img class="file-icon" src="${sftpFileIconPath(item)}" alt="" aria-hidden="true" draggable="false"><span class="file-name" title="${esc(item.name)}">${esc(item.name)}</span><span class="file-size">${item.is_dir?'':formatSize(item.size)}</span>`;const check=$('input',row);check.onchange=()=>{check.checked?state.selectedFiles.add(item):state.selectedFiles.delete(item);updateBatch()};row.ondblclick=e=>{if(row.classList.contains('editing'))return;if(e.target!==check)(item.is_dir?loadSftp(joinRemote(activeTab().last_path,item.name)):openFileEditor(joinRemote(activeTab().last_path,item.name)))};row.oncontextmenu=e=>showFileMenu(e,item);root.append(row)});const tab=activeTab();for(const task of state.uploadTasks.values())if(task.tabId===tab?.id&&task.directory===tab.last_path)renderUploadTask(task);if(!root.children.length)root.innerHTML='<div class="empty">空目录</div>'}
+
+let renameEditor=null;
+function cancelInlineRename(){
+  if(!renameEditor)return;
+  const {row,item}=renameEditor;renameEditor=null;
+  if(!row.isConnected)return;
+  row.classList.remove('editing');
+  const editor=$('.rename-editor',row);
+  if(editor){
+    const span=document.createElement('span');span.className='file-name';span.title=item.name;span.textContent=item.name;
+    editor.replaceWith(span);
+  }
+  const size=$('.file-size',row);
+  if(size)size.style.visibility='';
+}
+function startInlineRename(row,item){
+  cancelInlineRename();cancelInlineCreate();
+  if(!row.classList.contains('file-row'))return;
+  row.classList.add('editing');
+  const nameSpan=$('.file-name',row),sizeSpan=$('.file-size',row);
+  if(!nameSpan)return;
+  const editor=document.createElement('span');editor.className='rename-editor';
+  const input=document.createElement('input');input.type='text';input.value=item.name;input.spellcheck=false;input.setAttribute('aria-label','重命名');
+  const confirm=document.createElement('button');confirm.type='button';confirm.className='rename-confirm';confirm.textContent='✓';confirm.title='保存 (Enter)';
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='rename-cancel';cancel.textContent='×';cancel.title='取消 (Esc)';
+  editor.append(input,confirm,cancel);
+  nameSpan.replaceWith(editor);
+  if(sizeSpan)sizeSpan.style.visibility='hidden';
+  renameEditor={row,item};
+  const finish=async save=>{
+    if(!renameEditor||renameEditor.row!==row)return;
+    const name=input.value.trim();
+    if(!save||!name||name===item.name)return cancelInlineRename();
+    if(name.includes('/')||name==='.'||name==='..'){toast('无效的文件名',true);input.focus();return}
+    confirm.disabled=true;cancel.disabled=true;
+    const tab=activeTab(),payload=session_id=>JSON.stringify({session_id:tab.sessionId,source:joinRemote(tab.last_path,item.name),destination:joinRemote(tab.last_path,name),overwrite:session_id});
+    try{
+      await api('/api/sftp/move',{method:'POST',body:payload(false)});
+      cancelInlineRename();toast('已重命名');loadSftp();
+    }catch(err){
+      if(err.message.includes('存在')&&await themedConfirm('目标已存在，是否覆盖？')){
+        try{
+          await api('/api/sftp/move',{method:'POST',body:payload(true)});
+          cancelInlineRename();toast('已重命名');loadSftp();
+        }catch(retry){toast(retry.message,true)}
+      }else toast(err.message,true);
+      if(renameEditor?.row===row){confirm.disabled=false;cancel.disabled=false;input.focus()}
+    }
+  };
+  input.onkeydown=e=>{
+    if(e.key==='Enter'){e.preventDefault();finish(true)}
+    else if(e.key==='Escape'){e.preventDefault();finish(false)}
+  };
+  input.onblur=e=>{
+    if(e.relatedTarget?.closest?.('.rename-editor'))return;
+    setTimeout(()=>{if(document.activeElement?.closest?.('.rename-editor'))return;finish(false)},0);
+  };
+  confirm.onclick=()=>finish(true);
+  cancel.onclick=()=>finish(false);
+  input.focus();input.select();
+}
+let createEditor=null;
+function cancelInlineCreate(){
+  if(!createEditor)return;
+  const {row,wasEmpty}=createEditor;createEditor=null;
+  if(!row.isConnected)return;
+  row.remove();
+  if(wasEmpty&&!$('.file-row:not(.create-row)',$('#file-list')))$('#file-list').innerHTML='<div class="empty">空目录</div>';
+}
+function startInlineCreate(kind){
+  cancelInlineRename();cancelInlineCreate();
+  const tab=activeTab();if(!tab?.sessionId)return toast('请先连接终端',true);
+  const root=$('#file-list'),wasEmpty=!!$('.empty',root);
+  // 创建期间不显示文件图标：占位两个空单元格，成功后 loadSftp 按类型渲染图标
+  const row=document.createElement('div');row.className='file-row create-row';
+  const slot=document.createElement('span'),iconSlot=document.createElement('span'),sizeSlot=document.createElement('span');sizeSlot.className='file-size';
+  const editor=document.createElement('span');editor.className='rename-editor';
+  const input=document.createElement('input');input.type='text';input.placeholder=kind==='dir'?'新目录名称':'新文件名';input.spellcheck=false;input.setAttribute('aria-label',kind==='dir'?'新建目录':'新建文件');
+  const confirm=document.createElement('button');confirm.type='button';confirm.className='rename-confirm';confirm.textContent='✓';confirm.title='保存 (Enter)';
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='rename-cancel';cancel.textContent='×';cancel.title='取消 (Esc)';
+  editor.append(input,confirm,cancel);
+  row.append(slot,iconSlot,editor,sizeSlot);
+  $('.empty',root)?.remove();
+  root.prepend(row);
+  createEditor={row,wasEmpty};
+  const finish=async save=>{
+    if(createEditor?.row!==row)return;
+    const name=input.value.trim();
+    if(!save||!name)return cancelInlineCreate();
+    if(name.includes('/')||name.includes('\\')||name==='.'||name==='..'){toast('文件名不能包含路径分隔符',true);input.focus();return}
+    confirm.disabled=true;cancel.disabled=true;
+    try{
+      if(kind==='dir'){
+        await api('/api/sftp/mkdir',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:joinRemote(tab.last_path,name)})});
+        cancelInlineCreate();toast('目录已创建');loadSftp();
+      }else{
+        const path=joinRemote(tab.last_path,name);
+        await api('/api/sftp/file',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path})});
+        cancelInlineCreate();toast('文件已创建');await loadSftp();await openFileEditor(path);
+      }
+    }catch(err){
+      toast(err.message,true);
+      if(createEditor?.row===row){confirm.disabled=false;cancel.disabled=false;input.focus()}
+    }
+  };
+  input.onkeydown=e=>{
+    if(e.key==='Enter'){e.preventDefault();finish(true)}
+    else if(e.key==='Escape'){e.preventDefault();finish(false)}
+  };
+  input.onblur=e=>{
+    if(e.relatedTarget?.closest?.('.rename-editor'))return;
+    setTimeout(()=>{if(document.activeElement?.closest?.('.rename-editor'))return;finish(false)},0);
+  };
+  confirm.onclick=()=>finish(true);
+  cancel.onclick=()=>finish(false);
+  input.focus();
+}
+function chmodModeFromGrid(){let mode=0;$$('#chmod-grid input:checked').forEach(cb=>mode|=Number(cb.dataset.bit));return mode}
+function setChmodUI(mode){const value=Number(mode)&0o777;$$('#chmod-grid input').forEach(cb=>{cb.checked=!!(value&Number(cb.dataset.bit));cb.closest('.chmod-bit').classList.toggle('checked',cb.checked)});$('#chmod-mode').value=value.toString(8).padStart(3,'0')}
+function changePermissions(item){
+  const tab=activeTab();if(!tab?.sessionId)return toast('请先连接终端',true);
+  const dialog=$('#chmod-dialog'),grid=$('#chmod-grid'),modeInput=$('#chmod-mode');
+  $('#chmod-path').textContent=`${item.is_dir?'目录':'文件'} · ${joinRemote(tab.last_path,item.name)}`;
+  grid.replaceChildren();
+  for(const [role,r,w,x] of [['所有者',0o400,0o200,0o100],['组',0o040,0o020,0o010],['其他',0o004,0o002,0o001]]){
+    const row=document.createElement('div');row.className='chmod-row';
+    const label=document.createElement('span');label.className='chmod-role';label.textContent=role;
+    row.append(label);
+    for(const [bit,ch] of [[r,'r'],[w,'w'],[x,'x']]){
+      const bitLabel=document.createElement('label');bitLabel.className='chmod-bit';
+      const cb=document.createElement('input');cb.type='checkbox';cb.dataset.bit=String(bit);
+      cb.addEventListener('change',()=>{bitLabel.classList.toggle('checked',cb.checked);modeInput.value=chmodModeFromGrid().toString(8).padStart(3,'0')});
+      bitLabel.append(cb,document.createTextNode(ch));
+      row.append(bitLabel);
+    }
+    grid.append(row);
+  }
+  setChmodUI(item.mode);
+  modeInput.oninput=()=>{const value=modeInput.value.trim();if(/^[0-7]{3,4}$/.test(value))setChmodUI(parseInt(value,8))};
+  $$('.chmod-presets button').forEach(btn=>btn.onclick=()=>setChmodUI(parseInt(btn.dataset.mode,8)));
+  $('#chmod-form').onsubmit=async e=>{
+    e.preventDefault();
+    try{
+      await api('/api/sftp/chmod',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:joinRemote(tab.last_path,item.name),mode:chmodModeFromGrid()})});
+      dialog.close();toast('权限已修改');loadSftp();
+    }catch(err){toast(err.message,true)}
+  };
+  dialog.showModal();modeInput.focus();modeInput.select();
+}
 function updateBatch(){$('#batch-btn').classList.toggle('hidden',!state.selectedFiles.size);$('#batch-btn').textContent=`批量操作 (${state.selectedFiles.size})`}
 $('#batch-btn').onclick=async()=>{const items=[...state.selectedFiles],tab=activeTab();if(!items.length||!tab)return;const action=await themedInput('输入批量操作：move / copy / delete');if(!action)return;try{if(action==='delete'){if(!await themedConfirm(`递归删除选中的 ${items.length} 项？`))return;for(const item of items)await api('/api/sftp/delete',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:joinRemote(tab.last_path,item.name)})})}else if(action==='move'||action==='copy'){const target=await themedInput('目标目录完整路径');if(!target)return;for(const item of items)await api(`/api/sftp/${action}`,{method:'POST',body:JSON.stringify({session_id:tab.sessionId,source:joinRemote(tab.last_path,item.name),destination:joinRemote(target,item.name),overwrite:false})})}else return toast('未知操作',true);toast('批量操作完成');loadSftp()}catch(err){toast(err.message,true)}};
 function formatSize(n){if(n<1024)return `${n} B`;if(n<1048576)return `${(n/1024).toFixed(1)} KB`;return `${(n/1048576).toFixed(1)} MB`}
@@ -811,7 +970,8 @@ function showFileMenu(event,item){const tab=activeTab(),items=chosenItems(item),
   ...(!item.is_dir&&items.length===1?[{label:'下载',run:()=>downloadFile(item.name)}]:[]),
   {label:items.length>1?`复制 ${items.length} 项`:'复制',run:async()=>{state.remoteClipboard={sessionId:tab.sessionId,items:paths.map((path,i)=>({path,name:items[i].name})),mode:'copy'};toast('已复制，可在目标目录右键粘贴')}},
   {label:'粘贴到此目录',disabled:!item.is_dir||!state.remoteClipboard,run:()=>pasteRemote(joinRemote(tab.last_path,item.name))},
-  {label:'重命名',disabled:items.length!==1,run:async()=>{const name=await themedInput('新名称',item.name);if(!name||name===item.name)return;await api('/api/sftp/move',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,source:paths[0],destination:joinRemote(tab.last_path,name),overwrite:false})});loadSftp()}},
+  {label:'重命名',disabled:items.length!==1,run:()=>startInlineRename(event.target.closest('.file-row'),item)},
+  {label:'修改权限',disabled:items.length!==1,run:()=>changePermissions(item)},
   null,
   {label:items.length>1?`删除 ${items.length} 项`:'删除',run:async()=>{if(!await themedConfirm(`确定递归删除选中的 ${items.length} 项？`))return;for(const path of paths)await api('/api/sftp/delete',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path})});loadSftp()}},
   {label:'复制文件路径',disabled:items.length!==1,run:()=>copyText(paths[0])}
@@ -826,8 +986,52 @@ async function openFileEditor(path){const tab=activeTab();if(!tab?.sessionId)ret
 async function saveFileEditor(force=false){const e=state.editor;if(!e.cm||!e.path||e.saving||(!e.dirty&&!force))return;e.saving=true;updateEditorState();try{const result=await api('/api/sftp/editor',{method:'PUT',body:JSON.stringify({session_id:e.sessionId,path:e.path,content:e.cm.getValue(),expected_mtime:e.mtime,force})});e.mtime=result.mtime;e.dirty=false;toast('文件已保存');updateEditorState();loadSftp()}catch(err){e.saving=false;updateEditorState();if(err.message.includes('其他程序修改')&&await themedConfirm(`${err.message}\n\n仍要覆盖远端文件吗？`))return saveFileEditor(true);toast(err.message,true);return}e.saving=false;updateEditorState()}
 async function reloadFileEditor(){if(state.editor.dirty&&!await themedConfirm('放弃未保存的更改并重新载入？'))return;await openFileEditor(state.editor.path)}
 async function closeFileEditor(){if(state.editor.dirty&&!await themedConfirm('文件尚未保存，确定关闭？'))return;$('#file-editor-dialog').close()}
-async function createNewFile(){const tab=activeTab();if(!tab?.sessionId)return toast('请先连接终端',true);const name=await themedInput('新文件名');if(!name)return;if(name.includes('/')||name.includes('\\')||name==='.'||name==='..')return toast('文件名不能包含路径分隔符',true);const path=joinRemote(tab.last_path,name);try{await api('/api/sftp/file',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path})});await loadSftp();await openFileEditor(path)}catch(err){toast(err.message,true)}}
-function downloadFile(name){const tab=activeTab(),path=joinRemote(tab.last_path,name);const a=document.createElement('a');a.href=`/api/sftp/download?session_id=${encodeURIComponent(tab.sessionId)}&path=${encodeURIComponent(path)}`;a.download=name;a.click()}
+async function legacyDownload(url,name){
+  // 非 Chromium 环境（无 File System Access API）退回浏览器默认下载目录
+  try{
+    const head=await fetch(url,{method:'HEAD'});
+    if(!head.ok){let msg=head.statusText;try{msg=(await head.json()).detail||msg}catch{}throw new Error(msg)}
+    const a=document.createElement('a');a.href=url;a.download=name;a.click();
+    toast('已开始下载，文件将保存到浏览器下载目录');
+  }catch(err){toast(`下载失败：${err.message}`,true)}
+}
+async function saveDownloadWithPicker(url,name){
+  let handle;
+  try{
+    // 必须在任何 await 之前调用，否则用户激活状态过期无法弹出保存对话框
+    handle=await window.showSaveFilePicker({suggestedName:name});
+  }catch(err){
+    if(err.name==='AbortError')return; // 用户取消了保存对话框
+    return legacyDownload(url,name); // 环境不支持/被拒绝 → 退回默认下载
+  }
+  try{
+    const head=await fetch(url,{method:'HEAD'});
+    if(!head.ok){let msg=head.statusText;try{msg=(await head.json()).detail||msg}catch{}throw new Error(msg)}
+    toast('正在下载…');
+    const response=await fetch(url);
+    if(!response.ok){let msg=response.statusText;try{msg=(await response.json()).detail||msg}catch{}throw new Error(msg)}
+    if(!response.body)throw new Error('浏览器不支持流式保存');
+    const writable=await handle.createWritable();
+    const reader=response.body.getReader();
+    try{
+      while(true){
+        const {done,value}=await reader.read();
+        if(done)break;
+        await writable.write(value);
+      }
+    }finally{
+      try{await writable.close()}catch{}
+    }
+    toast(`已保存 ${name}`);
+  }catch(err){toast(`下载失败：${err.message}`,true)}
+}
+async function downloadFile(name){
+  const tab=activeTab();if(!tab?.sessionId)return toast('请先连接终端',true);
+  const path=joinRemote(tab.last_path,name);
+  const url=`/api/sftp/download?session_id=${encodeURIComponent(tab.sessionId)}&path=${encodeURIComponent(path)}`;
+  if(window.showSaveFilePicker)return saveDownloadWithPicker(url,name);
+  return legacyDownload(url,name);
+}
 function renderUploadTask(task){const root=$('#file-list');let row=$(`.upload-row[data-upload-key="${CSS.escape(task.key)}"]`,root);if(!row){$('.empty',root)?.remove();row=document.createElement('div');row.className='file-row upload-row';row.dataset.uploadKey=task.key;row.innerHTML=`<span></span><img class="file-icon" src="${sftpFileIconPath({name:task.file.name,is_dir:false})}" alt="" aria-hidden="true" draggable="false"><span class="file-name"></span><span class="upload-progress"><span class="upload-ring"></span><span class="upload-percent">0%</span></span>`;$('.file-name',row).textContent=task.file.name;root.append(row)}const percent=task.file.size?Math.min(100,Math.round(task.written/task.file.size*100)):100;$('.upload-ring',row).style.setProperty('--progress',`${percent*3.6}deg`);$('.upload-percent',row).textContent=task.status==='error'?'失败':task.status==='finishing'?'校验中':`${percent}%`;row.classList.toggle('upload-error',task.status==='error')}
 async function beginUpload(task,overwrite=false){const tab=state.tabs.find(t=>t.id===task.tabId);if(!tab?.sessionId)throw new Error('SSH 会话已断开');const init=await api('/api/sftp/uploads',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:task.directory,filename:task.file.name,size:task.file.size,overwrite})});task.uploadId=init.upload_id;const chunkSize=1024*1024;for(let offset=0;offset<task.file.size;offset+=chunkSize){const chunk=task.file.slice(offset,Math.min(offset+chunkSize,task.file.size));const result=await api(`/api/sftp/uploads/${task.uploadId}?offset=${offset}`,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:chunk});task.written=result.written;renderUploadTask(task)}task.status='finishing';renderUploadTask(task);await api(`/api/sftp/uploads/${task.uploadId}/finish`,{method:'POST'});task.status='done'}
 async function uploadFiles(files) {
@@ -869,10 +1073,10 @@ async function uploadFiles(files) {
   }
   loadSftp();
 }
-$('#upload-btn').onclick=()=>$('#upload-input').click();$('#upload-input').onchange=e=>uploadFiles(e.target.files);$('#sftp-refresh').onclick=()=>loadSftp();$('#sftp-go').onclick=()=>loadSftp();$('#sftp-path').onkeydown=e=>{if(e.key==='Enter')loadSftp()};$('#sftp-up').onclick=()=>{const p=activeTab()?.last_path||'.';loadSftp(p==='/'?'/':p.replace(/\/[^/]+\/?$/,'')||'/')};$('#mkdir-btn').onclick=async()=>{const tab=activeTab();if(!tab?.sessionId)return toast('请先连接终端',true);const name=await themedInput('目录名称');if(name)try{await api('/api/sftp/mkdir',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:joinRemote(tab.last_path,name)})});loadSftp()}catch(err){toast(err.message,true)}};
-$('#new-file-btn').onclick=createNewFile;$('#file-editor-save').onclick=()=>saveFileEditor();$('#file-editor-reload').onclick=reloadFileEditor;$('#file-editor-close').onclick=closeFileEditor;$('#file-editor-dialog').addEventListener('cancel',e=>{if(state.editor.dirty){e.preventDefault();closeFileEditor()}});
+$('#upload-btn').onclick=()=>$('#upload-input').click();$('#upload-input').onchange=e=>uploadFiles(e.target.files);$('#sftp-refresh').onclick=()=>loadSftp();$('#sftp-go').onclick=()=>loadSftp();$('#sftp-path').onkeydown=e=>{if(e.key==='Enter')loadSftp()};$('#sftp-up').onclick=()=>{const p=activeTab()?.last_path||'.';loadSftp(p==='/'?'/':p.replace(/\/[^/]+\/?$/,'')||'/')};$('#mkdir-btn').onclick=()=>startInlineCreate('dir');
+$('#new-file-btn').onclick=()=>startInlineCreate('file');$('#file-editor-save').onclick=()=>saveFileEditor();$('#file-editor-reload').onclick=reloadFileEditor;$('#file-editor-close').onclick=closeFileEditor;$('#file-editor-dialog').addEventListener('cancel',e=>{if(state.editor.dirty){e.preventDefault();closeFileEditor()}});
 const drop=$('#file-list');['dragenter','dragover'].forEach(x=>drop.addEventListener(x,e=>{e.preventDefault();drop.classList.add('drag')}));['dragleave','drop'].forEach(x=>drop.addEventListener(x,e=>{e.preventDefault();drop.classList.remove('drag')}));drop.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files));
-drop.addEventListener('contextmenu',e=>{if(e.target.closest('.file-row'))return;const tab=activeTab();showContextMenu(e,[{label:'新建文件',run:createNewFile},{label:'新建目录',run:()=>$('#mkdir-btn').click()},{label:'上传文件',run:()=>$('#upload-input').click()},null,{label:'粘贴',disabled:!state.remoteClipboard,run:()=>pasteRemote(tab.last_path)},{label:'刷新',run:()=>loadSftp()}])});
+drop.addEventListener('contextmenu',e=>{if(e.target.closest('.file-row'))return;const tab=activeTab();showContextMenu(e,[{label:'新建文件',run:()=>startInlineCreate('file')},{label:'新建目录',run:()=>startInlineCreate('dir')},{label:'上传文件',run:()=>$('#upload-input').click()},null,{label:'粘贴',disabled:!state.remoteClipboard,run:()=>pasteRemote(tab.last_path)},{label:'刷新',run:()=>loadSftp()}])});
 document.addEventListener('pointerdown',e=>{if(!e.target.closest('.context-menu'))closeContextMenu()});window.addEventListener('blur',closeContextMenu);
 
 $$('.side-tab').forEach(btn=>btn.onclick=()=>{$$('.side-tab').forEach(x=>x.classList.toggle('active',x===btn));$$('.side-panel').forEach(x=>x.classList.toggle('active',x.id===`panel-${btn.dataset.panel}`))});

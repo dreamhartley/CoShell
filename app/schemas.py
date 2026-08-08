@@ -41,6 +41,12 @@ class PathBody(BaseModel):
     path: str
 
 
+class ChmodBody(BaseModel):
+    session_id: str
+    path: str
+    mode: int = Field(ge=0, le=0o7777)
+
+
 class TransferBody(BaseModel):
     session_id: str
     source: str
