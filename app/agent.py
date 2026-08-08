@@ -141,7 +141,7 @@ def stream_chat_message(base_url: str, api_key: str, payload: dict[str, Any], on
             on_event({"type": "thinking_end"})
             thinking = False
 
-    for event in openai_stream_request(base_url, api_key, "chat/completions", payload, timeout=90):
+    for event in openai_stream_request(base_url, api_key, "chat/completions", payload, timeout=300):
         choices = event.get("choices") or []
         if not choices or not isinstance(choices[0], dict):
             continue
@@ -247,8 +247,7 @@ QUICK_FIX_SYSTEM_PROMPT = """你是终端现场快速处置 Agent，正在用户
 这不是普通聊天入口。若任务演变为部署、迁移、长期研究或复杂多阶段工作，应总结已掌握的现场和进度并结束本次快速处置，不要访问或改变其他 Agent 入口的会话、状态或权限模式。
 最终回答保持简短，明确说明原因、采取的操作、验证结果和仍需用户处理的事项。"""
 
-MAX_AGENT_ROUNDS = 30
-MAX_COMMAND_TIMEOUT = 900
+# 工具调用轮数与命令时长不设上限,由模型自行决定节奏;用户可随时停止(取消事件)。
 MAX_FETCH_BYTES = 2 * 1024 * 1024
 MAX_FETCH_TEXT = 20_000
 MAX_FETCH_LINKS = 50
@@ -588,7 +587,6 @@ class AgentRegistry:
         stream_response: bool = False,
         system_prompt: str = SYSTEM_PROMPT,
         workspace_instructions: str | None = None,
-        max_rounds: int = MAX_AGENT_ROUNDS,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if not text.strip():
@@ -642,7 +640,7 @@ class AgentRegistry:
                 )
             messages = [{"role": "system", "content": system_prompt + "\n" + runtime_note + "\n" + search_note + instructions_note}, *conversation.messages, {"role": "user", "content": text.strip()}]
             steps: list[dict[str, Any]] = []
-            for _ in range(max(1, min(MAX_AGENT_ROUNDS, max_rounds))):
+            while True:
                 if cancel_event and cancel_event.is_set():
                     raise AgentCancelled("Agent 任务已停止")
                 request_payload = {
@@ -656,7 +654,7 @@ class AgentRegistry:
                 if stream_response and on_event:
                     message = stream_chat_message(base_url, api_key, request_payload, on_event)
                 else:
-                    response = openai_request(base_url, api_key, "chat/completions", method="POST", payload=request_payload, timeout=90)
+                    response = openai_request(base_url, api_key, "chat/completions", method="POST", payload=request_payload, timeout=300)
                     choices = response.get("choices") or []
                     if not choices or not isinstance(choices[0], dict):
                         raise AgentError("AI API 未返回有效回复")
@@ -681,7 +679,7 @@ class AgentRegistry:
                         try:
                             arguments = json.loads(function.get("arguments") or "{}")
                             command = str(arguments.get("command") or "").strip()
-                            timeout = max(5, min(MAX_COMMAND_TIMEOUT, int(arguments.get("timeout", 120))))
+                            timeout = max(5, int(arguments.get("timeout", 120)))
                             if not command:
                                 raise ValueError("命令为空")
                             approved = command_approver(command) if command_approver else True
@@ -779,18 +777,3 @@ class AgentRegistry:
                     else:
                         result = {"error": "不支持的工具"}
                     messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(result, ensure_ascii=False)})
-            messages.append({"role": "system", "content": "工具执行轮次已达到本次任务上限。不要再调用工具；请根据已有执行结果总结当前完成情况、明确尚未完成的步骤，并告诉用户可以在当前入口发送“继续”接着处理。"})
-            try:
-                final_payload = {"model": model, "messages": messages, "temperature": 0.2, **model_request_options(model)}
-                if stream_response and on_event:
-                    message = stream_chat_message(base_url, api_key, final_payload, on_event)
-                else:
-                    response = openai_request(base_url, api_key, "chat/completions", method="POST", payload=final_payload, timeout=90)
-                    choices = response.get("choices") or []
-                    message = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
-                answer = (message or {}).get("content") or "本次任务已执行较多步骤，但尚未得到最终确认。请在当前入口发送“继续”接着处理。"
-            except AgentError:
-                answer = f"本次任务已达到 {max(1, min(MAX_AGENT_ROUNDS, max_rounds))} 轮执行上限。已执行的命令和结果显示在上方，请在当前入口发送“继续”接着处理。"
-            messages.append({"role": "assistant", "content": answer})
-            conversation.messages = messages[1:][-40:]
-            return {"message": answer, "steps": steps, "limit_reached": True}

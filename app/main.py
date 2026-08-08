@@ -589,7 +589,7 @@ def execute_agent_command(session_id: str, command: str, timeout: int, on_output
     if len(command) > 20000:
         raise ValueError("命令过长")
     session = sessions.get(session_id)
-    timeout = max(5, min(900, timeout))
+    timeout = max(5, timeout)
     _, stdout, _ = session.client.exec_command(command, timeout=timeout, get_pty=False)
     channel = stdout.channel
     deadline = time.monotonic() + timeout
@@ -725,7 +725,7 @@ async def agent_chat(body: AgentChatBody):
             local_executor=lambda tool_name, arguments: agent_workspace.execute(body.session_id, tool_name, arguments),
             local_tool_names={"initialize_host_workspace"},
             workspace_instructions=agent_workspace.agent_instructions(body.session_id),
-            system_prompt=QUICK_FIX_SYSTEM_PROMPT, max_rounds=12,
+            system_prompt=QUICK_FIX_SYSTEM_PROMPT,
         )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -852,7 +852,7 @@ async def terminal_agent_stream(body: TerminalAgentBody):
 
         def execute(command: str, timeout: int) -> dict[str, Any]:
             return execute_agent_command(
-                body.session_id, command, min(timeout, 300),
+                body.session_id, command, timeout,
                 lambda stream, data: emit({"type": "command_output", "stream": stream, "data": data}),
                 cancel_event,
             )
@@ -870,7 +870,7 @@ async def terminal_agent_stream(body: TerminalAgentBody):
                     command_approver=agent_command_approver(body.session_id, body.permission_mode, emit, cancel_event, "terminal"),
                     workspace_instructions=agent_workspace.agent_instructions(body.session_id),
                     on_event=emit, stream_response=True, system_prompt=QUICK_FIX_SYSTEM_PROMPT,
-                    max_rounds=12, cancel_event=cancel_event,
+                    cancel_event=cancel_event,
                 )
                 emit({"type": "answer", "message": result["message"], "limit_reached": bool(result.get("limit_reached"))})
             except AgentCancelled:
