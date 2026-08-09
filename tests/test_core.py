@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from app.database import Database
 from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path, create_ssh_key_pair, normalize_remote_os, parse_private_key, save_ssh_key_pair
 from app.vault import Vault, VaultError
-from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, web_search
+from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, trim_conversation_history, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
 from app.schemas import SSHKeyGenerateBody, ServerBody, ShortcutBody
 from app import main as main_app
@@ -750,6 +750,63 @@ def test_deepseek_tool_round_replays_reasoning_content(monkeypatch):
     assert assistant["reasoning_content"] == "hidden plan"
 
 
+def test_deepseek_assistant_messages_always_carry_reasoning_content(monkeypatch):
+    """DeepSeek 思考模式要求回传时每个 assistant 消息都带 reasoning_content 字段；
+    网关未转发思考内容时也要以空串占位，避免上游 400。"""
+    replies = iter([
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "call-1", "type": "function", "function": {"name": "execute_command", "arguments": '{"command":"pwd"}'}},
+        ]}}]},
+        {"choices": [{"message": {"content": "done"}}]},
+        {"choices": [{"message": {"content": "continued"}}]},
+    ])
+    payloads = []
+    def fake_request(*_args, **kwargs):
+        payloads.append(kwargs["payload"])
+        return next(replies)
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    AgentRegistry().chat(
+        "ssh-ds-fallback", "where", "https://example.test/v1", "key", "deepseek-v4-flash",
+        lambda *_args: {"exit_code": 0, "stdout": "/root\n", "stderr": ""},
+    )
+    AgentRegistry().chat(
+        "ssh-ds-fallback", "go on", "https://example.test/v1", "key", "deepseek-v4-flash",
+        lambda *_args: {"exit_code": 0, "stdout": "", "stderr": ""},
+    )
+    for message in payloads[1]["messages"] + payloads[2]["messages"]:
+        if message["role"] == "assistant":
+            assert "reasoning_content" in message, f"assistant 消息缺少 reasoning_content: {message}"
+    assert payloads[1]["messages"][-3]["reasoning_content"] == ""  # 工具轮未捕获思考，空串占位
+    assert payloads[1]["messages"][-1]["reasoning_content"] == ""  # 最终回答同样占位
+
+
+def test_non_deepseek_model_skips_empty_reasoning_fallback(monkeypatch):
+    replies = iter([
+        {"choices": [{"message": {"content": "plain answer"}}]},
+    ])
+    payloads = []
+    def fake_request(*_args, **kwargs):
+        payloads.append(kwargs["payload"])
+        return next(replies)
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    AgentRegistry().chat("ssh-plain", "hi", "https://example.test/v1", "key", "gpt-compatible",
+                         lambda *_args: {"exit_code": 0, "stdout": "", "stderr": ""})
+    assistant = next(message for message in payloads[0]["messages"] if message["role"] == "assistant")
+    assert "reasoning_content" not in assistant
+
+
+def test_stream_captures_reasoning_from_message_field(monkeypatch):
+    """delta 是含空字段的占位对象时，仍要从 message 里读取思考内容。"""
+    chunks = [
+        {"choices": [{"delta": {"content": None}, "message": {"reasoning_content": "think"}}]},
+        {"choices": [{"delta": {"content": "answer"}}]},
+    ]
+    monkeypatch.setattr("app.agent.openai_stream_request", lambda *_args, **_kwargs: iter(chunks))
+    events = []
+    message = stream_chat_message("https://example.test/v1", "key", {"model": "model"}, events.append)
+    assert message == {"content": "answer", "reasoning_content": "think"}
+
+
 def test_openai_stream_stops_on_finish_reason_without_done(monkeypatch):
     class FakeResponse:
         def __enter__(self): return self
@@ -980,6 +1037,96 @@ def test_agent_can_disable_builtin_search_and_use_mcp(monkeypatch):
     assert "mcp_7_web_search" in names
     assert calls == [(7, "web_search", {"query": "release"})]
     assert result["steps"] == [{"mcp": "Search", "tool": "web_search"}]
+
+
+def _assert_tool_messages_follow_their_owner(messages):
+    """每个 tool 结果之前必须存在带 tool_calls 的 assistant 消息（并行批次可连续多条）。"""
+    pending_tool_calls = False
+    for message in messages:
+        if message["role"] == "assistant":
+            pending_tool_calls = bool(message.get("tool_calls"))
+        elif message["role"] == "tool":
+            assert pending_tool_calls, "tool 结果前缺少带 tool_calls 的 assistant 消息"
+
+
+def test_trim_conversation_history_never_starts_with_orphan_tool():
+    system = [{"role": "system", "content": "s"}]
+    tool_result = {"role": "tool", "tool_call_id": "call-x", "content": "{}"}
+    # 44 条历史:边界 [-40:] 恰好落在第 1 轮的工具结果上,必须把开头的 tool 全部丢弃。
+    messages = [*system, {"role": "user", "content": "u"}]
+    for round_index in range(2):
+        messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"a{round_index}", "type": "function", "function": {"name": "f", "arguments": "{}"}}]})
+        for _ in range(20):
+            messages.append(tool_result)
+    messages.append({"role": "assistant", "content": "完成"})
+    trimmed = trim_conversation_history(messages)
+    assert trimmed[0]["role"] != "tool"
+    _assert_tool_messages_follow_their_owner(trimmed)
+    # 边界落在 assistant(tool_calls) 上时保留它,不额外截断。
+    alternate = [*system, {"role": "user", "content": "u"}]
+    for _ in range(20):
+        alternate.append({"role": "assistant", "content": "", "tool_calls": [{"id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}}]})
+        alternate.append(tool_result)
+    alternate.append({"role": "assistant", "content": "完成"})
+    trimmed = trim_conversation_history(alternate)
+    assert trimmed[0]["role"] == "assistant" and trimmed[0].get("tool_calls")
+    # 不足上限时原样保留(仅去掉 system)。
+    short = [*system, {"role": "user", "content": "u"}, {"role": "assistant", "content": "ok"}]
+    assert trim_conversation_history(short) == short[1:]
+
+
+def test_long_tool_loop_then_followup_request_has_valid_tool_pairing(monkeypatch):
+    def tool_round():
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": f"call-{index}", "type": "function", "function": {"name": "execute_command", "arguments": f'{{"command":"echo {index}"}}'}}
+            for index in range(20)
+        ]}}]}
+
+    replies = iter([
+        tool_round(), tool_round(),
+        {"choices": [{"message": {"content": "部署完成。"}}]},
+        {"choices": [{"message": {"content": "确认完成。"}}]},
+    ])
+    payloads = []
+
+    def fake_request(*_args, **kwargs):
+        # 记录消息列表引用;assistant/tool 消息在响应返回后才追加,回合结束后列表即完整快照。
+        payloads.append(kwargs["payload"])
+        return next(replies)
+
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    registry = AgentRegistry()
+    executor = lambda command, timeout: {"exit_code": 0, "stdout": "ok", "stderr": ""}
+    registry.chat("ssh-long", "部署应用", "https://example.test/v1", "key", "model", executor)
+    assert len(payloads[0]["messages"]) > 40  # 单轮就超过历史上限,截断必然发生
+    registry.chat("ssh-long", "继续", "https://example.test/v1", "key", "model", executor)
+    messages = payloads[-1]["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] != "tool"
+    _assert_tool_messages_follow_their_owner(messages[1:])
+
+
+def test_tool_calls_without_id_get_consistent_fallback_id(monkeypatch):
+    replies = iter([
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"type": "function", "function": {"name": "execute_command", "arguments": '{"command":"pwd"}'}},
+        ]}}]},
+        {"choices": [{"message": {"content": "完成"}}]},
+    ])
+    payloads = []
+
+    def fake_request(*_args, **kwargs):
+        payloads.append(kwargs["payload"])
+        return next(replies)
+
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    AgentRegistry().chat("ssh-noid", "运行", "https://example.test/v1", "key", "model",
+                         lambda command, timeout: {"exit_code": 0, "stdout": "/", "stderr": ""})
+    messages = payloads[0]["messages"]
+    assert messages[-3]["role"] == "assistant"
+    assert messages[-3]["tool_calls"][0]["id"] == "call_0"
+    assert messages[-2]["role"] == "tool"
+    assert messages[-2]["tool_call_id"] == "call_0"
 
 
 def test_mcp_url_and_search_tool_filter():

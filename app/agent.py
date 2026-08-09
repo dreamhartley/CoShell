@@ -146,8 +146,13 @@ def stream_chat_message(base_url: str, api_key: str, payload: dict[str, Any], on
         if not choices or not isinstance(choices[0], dict):
             continue
         received = True
-        delta = choices[0].get("delta") or choices[0].get("message") or {}
-        thought = delta.get("reasoning_content") or delta.get("reasoning")
+        # 网关可能在 delta 或 message 中任一处下发 reasoning/content，
+        # 合并读取，避免 delta 存在但缺失某字段时漏掉 message 里的思考内容。
+        delta = {**(choices[0].get("message") or {}), **(choices[0].get("delta") or {})}
+        thought = (
+            delta.get("reasoning_content") or delta.get("reasoning")
+            or event.get("reasoning_content") or event.get("reasoning")
+        )
         if isinstance(thought, str) and thought:
             reasoning.append(thought)
             if not thinking:
@@ -190,7 +195,12 @@ def stream_chat_message(base_url: str, api_key: str, payload: dict[str, Any], on
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
     if tool_calls:
-        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+        # 网关可能不在流式增量里下发 tool_call id；合成稳定 id，保证后续
+        # tool 结果消息能与之配对，避免上游 400。
+        message["tool_calls"] = [
+            dict(tool_calls[index], id=tool_calls[index].get("id") or f"call_{index}")
+            for index in sorted(tool_calls)
+        ]
     return message
 
 
@@ -560,6 +570,23 @@ def web_fetch(url: str) -> dict[str, Any]:
     return {"url": final_url, "title": title, "content_type": content_type, "text": text, "links": links, "truncated": len(text) >= MAX_FETCH_TEXT}
 
 
+def trim_conversation_history(messages: list[dict[str, Any]], max_messages: int = 40) -> list[dict[str, Any]]:
+    """Keep the trailing part of a conversation (excluding the leading system message).
+
+    The slice boundary must never land on a tool result: its owning
+    assistant(tool_calls) message would be dropped, and upstream providers
+    reject an orphaned tool message with HTTP 400
+    ("Messages with role 'tool' must be a response to a preceding message
+    with 'tool_calls'").
+    """
+    history = messages[1:]
+    if len(history) > max_messages:
+        history = history[-max_messages:]
+        while history and history[0].get("role") == "tool":
+            history.pop(0)
+    return history
+
+
 @dataclass
 class AgentConversation:
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -638,7 +665,11 @@ class AgentRegistry:
                     f"{workspace_instructions.strip()}\n"
                     "</host_agents_md>"
                 )
-            messages = [{"role": "system", "content": system_prompt + "\n" + runtime_note + "\n" + search_note + instructions_note}, *conversation.messages, {"role": "user", "content": text.strip()}]
+            # 防御性剔除历史开头的孤立 tool 结果（正常路径已由 trim_conversation_history 保证）。
+            history = conversation.messages
+            while history and history[0].get("role") == "tool":
+                history = history[1:]
+            messages = [{"role": "system", "content": system_prompt + "\n" + runtime_note + "\n" + search_note + instructions_note}, *history, {"role": "user", "content": text.strip()}]
             steps: list[dict[str, Any]] = []
             while True:
                 if cancel_event and cancel_event.is_set():
@@ -660,15 +691,27 @@ class AgentRegistry:
                         raise AgentError("AI API 未返回有效回复")
                     message = choices[0].get("message") or {}
                 assistant_message: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
-                if message.get("reasoning_content"):
-                    assistant_message["reasoning_content"] = message["reasoning_content"]
+                reasoning_text = message.get("reasoning_content") or message.get("reasoning")
+                if reasoning_text:
+                    assistant_message["reasoning_content"] = reasoning_text
+                elif "deepseek" in model.lower():
+                    # DeepSeek 思考模式下，历史中的 assistant 消息必须把 reasoning_content
+                    # 一并回传；网关偶尔不转发某轮的思考内容（工具轮/缓存命中/短回复），
+                    # 若缺字段，下一轮上游会 400（"reasoning_content in the thinking mode
+                    # must be passed back"）。未捕获到时也带空串，保证字段恒存在。
+                    assistant_message["reasoning_content"] = ""
                 tool_calls = message.get("tool_calls") or []
                 if tool_calls:
+                    # 网关可能省略 tool_call id；补齐后 assistant 消息与后续
+                    # tool 结果使用同一 id，保持配对关系有效。
+                    for index, call in enumerate(tool_calls):
+                        if isinstance(call, dict) and not str(call.get("id") or "").strip():
+                            call["id"] = f"call_{index}"
                     assistant_message["tool_calls"] = tool_calls
                 messages.append(assistant_message)
                 if not tool_calls:
                     answer = assistant_message["content"] or "任务已结束。"
-                    conversation.messages = messages[1:][-40:]
+                    conversation.messages = trim_conversation_history(messages)
                     return {"message": answer, "steps": steps}
                 for call in tool_calls:
                     if cancel_event and cancel_event.is_set():
