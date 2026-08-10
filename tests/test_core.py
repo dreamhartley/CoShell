@@ -628,6 +628,92 @@ def test_agent_denied_command_is_not_executed(monkeypatch):
     assert result["message"] == "已取消删除。"
 
 
+def test_agent_retries_transient_request_errors(monkeypatch):
+    calls = []
+
+    def fake_request(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) < 3:
+            raise AgentError("连接超时")
+        return {"choices": [{"message": {"content": "网络恢复，任务继续"}}]}
+
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    monkeypatch.setattr("app.agent._retry_delay_seconds", lambda _attempt: 0)
+    events = []
+    result = AgentRegistry().chat(
+        "ssh-retry", "检查网络", "https://example.test/v1", "key", "model",
+        lambda *_args: {"exit_code": 0, "stdout": "", "stderr": ""},
+        on_event=events.append,
+    )
+    assert len(calls) == 3
+    assert result["message"] == "网络恢复，任务继续"
+    retries = [event for event in events if event["type"] == "activity" and event["activity"] == "retry"]
+    assert len(retries) == 2
+    assert retries[0]["label"].startswith("第 1/10 次")
+
+
+def test_retry_delay_grows_then_stays_capped():
+    from app.agent import _retry_delay_seconds
+    assert [_retry_delay_seconds(i) for i in range(1, 7)] == [1.0, 2.0, 4.0, 8.0, 10.0, 10.0]
+
+
+def test_agent_does_not_retry_invalid_request(monkeypatch):
+    calls = []
+
+    def fake_request(*_args, **_kwargs):
+        calls.append(1)
+        raise AgentError("参数错误", 400)
+
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    with pytest.raises(AgentError, match="参数错误"):
+        AgentRegistry().chat("ssh-bad", "hi", "https://example.test/v1", "key", "model", lambda *_args: {})
+    assert len(calls) == 1
+
+
+def test_agent_retries_streaming_failure_and_clears_partial_answer(monkeypatch):
+    calls = []
+
+    def fake_stream(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise AgentError("连接中断")
+        return iter([{"choices": [{"delta": {"content": "重试后回答"}}]}])
+
+    monkeypatch.setattr("app.agent.openai_stream_request", fake_stream)
+    monkeypatch.setattr("app.agent._retry_delay_seconds", lambda _attempt: 0)
+    events = []
+    result = AgentRegistry().chat(
+        "ssh-stream-retry", "hi", "https://example.test/v1", "key", "model",
+        lambda *_args: {"exit_code": 0, "stdout": "", "stderr": ""},
+        on_event=events.append, stream_response=True,
+    )
+    assert len(calls) == 2
+    assert result["message"] == "重试后回答"
+    assert {"type": "answer_cancel"} in events
+    assert {"type": "thinking_end"} in events
+
+
+def test_agent_round_limit_returns_summary_and_marks_limit(monkeypatch):
+    def fake_request(*_args, **kwargs):
+        payload = kwargs["payload"]
+        if "tools" not in payload:  # 轮数上限后的最终总结请求不带工具
+            return {"choices": [{"message": {"content": "已达上限，先总结到这里。"}}]}
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "call", "type": "function", "function": {"name": "execute_command", "arguments": '{"command":"echo 1"}'}},
+        ]}}]}
+
+    monkeypatch.setattr("app.agent.openai_request", fake_request)
+    commands = []
+    result = AgentRegistry().chat(
+        "ssh-limit", "持续执行", "https://example.test/v1", "key", "model",
+        lambda command, timeout: commands.append(command) or {"exit_code": 0, "stdout": "1\n", "stderr": ""},
+        max_rounds=3,
+    )
+    assert commands == ["echo 1"] * 3
+    assert result["limit_reached"] is True
+    assert result["message"] == "已达上限，先总结到这里。"
+
+
 @pytest.mark.parametrize("command", [
     "rm -rf /var/lib/demo",
     "sudo -n sh -c 'rm -rf /var/lib/demo'",

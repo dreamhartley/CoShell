@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -204,6 +205,52 @@ def stream_chat_message(base_url: str, api_key: str, payload: dict[str, Any], on
     return message
 
 
+def _retry_delay_seconds(attempt: int) -> float:
+    """重试间隔：1、2、4、8 秒递增，达到 RETRY_MAX_DELAY 后固定不再增长。"""
+    return min(2.0 ** (attempt - 1), RETRY_MAX_DELAY)
+
+
+def _is_retryable_error(exc: AgentError) -> bool:
+    """连接类失败（无状态码）与网关可恢复错误（限流/5xx 等）值得自动重试。"""
+    return exc.status_code is None or exc.status_code in RETRYABLE_STATUS_CODES
+
+
+def _chat_completion_request(
+    base_url: str, api_key: str, model: str, payload: dict[str, Any], *,
+    stream_response: bool, on_event: Callable[[dict[str, Any]], None] | None,
+    cancel_event: threading.Event | None,
+) -> dict[str, Any]:
+    """请求一次模型回复；网络波动等可恢复错误自动重试，最多 MAX_REQUEST_ATTEMPTS 次。
+
+    流式回复中途失败时先丢弃已渲染的部分内容（answer_cancel/thinking_end），
+    重试成功后界面上不会出现重复或残缺片段。
+    """
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            if stream_response and on_event:
+                return stream_chat_message(base_url, api_key, payload, on_event)
+            response = openai_request(base_url, api_key, "chat/completions", method="POST", payload=payload, timeout=300)
+            choices = response.get("choices") or []
+            if not choices or not isinstance(choices[0], dict):
+                raise AgentError("AI API 未返回有效回复")
+            return choices[0].get("message") or {}
+        except AgentError as exc:
+            if attempt >= MAX_REQUEST_ATTEMPTS or not _is_retryable_error(exc):
+                if attempt > 1 and _is_retryable_error(exc):
+                    raise AgentError(f"{exc}（已自动重试 {attempt - 1} 次）", exc.status_code) from exc
+                raise
+            if cancel_event and cancel_event.is_set():
+                raise AgentCancelled("Agent 任务已停止")
+            if on_event:
+                on_event({"type": "answer_cancel"})
+                on_event({"type": "thinking_end"})
+                on_event({"type": "activity", "activity": "retry", "label": f"第 {attempt}/{MAX_REQUEST_ATTEMPTS} 次：{exc}"})
+            time.sleep(_retry_delay_seconds(attempt))
+            if cancel_event and cancel_event.is_set():
+                raise AgentCancelled("Agent 任务已停止")
+    raise AgentError("AI API 请求失败")  # 不可达，仅满足类型检查
+
+
 def list_models(base_url: str, api_key: str) -> tuple[list[str], str]:
     base = normalize_api_base(base_url)
     candidates = [base]
@@ -257,7 +304,13 @@ QUICK_FIX_SYSTEM_PROMPT = """你是终端现场快速处置 Agent，正在用户
 这不是普通聊天入口。若任务演变为部署、迁移、长期研究或复杂多阶段工作，应总结已掌握的现场和进度并结束本次快速处置，不要访问或改变其他 Agent 入口的会话、状态或权限模式。
 最终回答保持简短，明确说明原因、采取的操作、验证结果和仍需用户处理的事项。"""
 
-# 工具调用轮数与命令时长不设上限,由模型自行决定节奏;用户可随时停止(取消事件)。
+# 单次任务的自动执行轮数上限，防止工具调用陷入无限循环；命令时长不设上限。
+MAX_AGENT_ROUNDS = 500
+# AI 请求的自动重试次数与可恢复错误码：网络波动、限流与网关 5xx 会静默重试。
+MAX_REQUEST_ATTEMPTS = 10
+RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+# 重试间隔上限：前几次指数递增，达到该值后固定，避免长时间空等。
+RETRY_MAX_DELAY = 10.0
 MAX_FETCH_BYTES = 2 * 1024 * 1024
 MAX_FETCH_TEXT = 20_000
 MAX_FETCH_LINKS = 50
@@ -614,6 +667,7 @@ class AgentRegistry:
         stream_response: bool = False,
         system_prompt: str = SYSTEM_PROMPT,
         workspace_instructions: str | None = None,
+        max_rounds: int = MAX_AGENT_ROUNDS,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if not text.strip():
@@ -671,7 +725,8 @@ class AgentRegistry:
                 history = history[1:]
             messages = [{"role": "system", "content": system_prompt + "\n" + runtime_note + "\n" + search_note + instructions_note}, *history, {"role": "user", "content": text.strip()}]
             steps: list[dict[str, Any]] = []
-            while True:
+            max_rounds = max(1, min(MAX_AGENT_ROUNDS, max_rounds))
+            for _ in range(max_rounds):
                 if cancel_event and cancel_event.is_set():
                     raise AgentCancelled("Agent 任务已停止")
                 request_payload = {
@@ -682,14 +737,10 @@ class AgentRegistry:
                 # ("reasoning_content in the thinking mode must be passed back"),保持默认 auto 即可。
                 if "deepseek" in model.lower():
                     request_payload.pop("tool_choice", None)
-                if stream_response and on_event:
-                    message = stream_chat_message(base_url, api_key, request_payload, on_event)
-                else:
-                    response = openai_request(base_url, api_key, "chat/completions", method="POST", payload=request_payload, timeout=300)
-                    choices = response.get("choices") or []
-                    if not choices or not isinstance(choices[0], dict):
-                        raise AgentError("AI API 未返回有效回复")
-                    message = choices[0].get("message") or {}
+                message = _chat_completion_request(
+                    base_url, api_key, model, request_payload,
+                    stream_response=stream_response, on_event=on_event, cancel_event=cancel_event,
+                )
                 assistant_message: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
                 reasoning_text = message.get("reasoning_content") or message.get("reasoning")
                 if reasoning_text:
@@ -820,3 +871,17 @@ class AgentRegistry:
                     else:
                         result = {"error": "不支持的工具"}
                     messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(result, ensure_ascii=False)})
+        # 达到自动执行轮数上限：让模型基于已有结果做一次总结，而不是直接中断任务。
+        messages.append({"role": "system", "content": "工具执行轮次已达到本次任务上限。不要再调用工具；请根据已有执行结果总结当前完成情况、明确尚未完成的步骤，并告诉用户可以在当前入口发送“继续”接着处理。"})
+        try:
+            final_payload = {"model": model, "messages": messages, "temperature": 0.2, **model_request_options(model)}
+            final_message = _chat_completion_request(
+                base_url, api_key, model, final_payload,
+                stream_response=stream_response, on_event=on_event, cancel_event=cancel_event,
+            )
+            answer = final_message.get("content") or "本次任务已执行较多步骤，但尚未得到最终确认。请在当前入口发送“继续”接着处理。"
+        except AgentError:
+            answer = f"本次任务已达到 {max_rounds} 轮执行上限。已执行的命令和结果显示在上方，请在当前入口发送“继续”接着处理。"
+        messages.append({"role": "assistant", "content": answer})
+        conversation.messages = trim_conversation_history(messages)
+        return {"message": answer, "steps": steps, "limit_reached": True}
