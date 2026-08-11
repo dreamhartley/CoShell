@@ -311,6 +311,21 @@ $('#agent-permission-mode').onclick=()=>{const tab=activeTab();if(tab?.agentBusy
 $('#agent-new-chat').onclick=async()=>{const tab=activeTab();if(!tab||tab.agentBusy)return;if(tab.sessionId)try{await api('/api/agent/chat/reset',{method:'POST',body:JSON.stringify({session_id:tab.sessionId})})}catch(err){return toast(err.message,true)}tab.agentChat=[];tab.agentPendingContext=null;renderAgentChat();toast('已新建 Agent 对话')};
 $('#agent-attach-terminal').onclick=()=>{const tab=activeTab();if(!tab?.sessionId)return toast('请先连接并选择一个终端',true);tab.agentPendingContext=recentTerminalContext(tab);renderAgentChat();$('#agent-chat-input').focus()};
 $('#agent-terminal-context-remove').onclick=()=>{const tab=activeTab();if(!tab)return;tab.agentPendingContext=null;renderAgentChat();$('#agent-chat-input').focus()};
+let agentChatSelection='';
+$('#agent-chat').addEventListener('pointerdown',event=>{
+  if(event.button!==2)return;
+  const selection=window.getSelection();
+  agentChatSelection=selection&&!selection.isCollapsed?selection.toString():'';
+});
+$('#agent-chat').addEventListener('contextmenu',event=>{
+  const selection=window.getSelection();
+  const selected=selection&&!selection.isCollapsed?selection.toString():agentChatSelection;
+  const message=event.target.closest('.agent-message'),messageText=message?.querySelector('.agent-markdown')?.textContent.trim()||'';
+  showContextMenu(event,[
+    {label:'复制',disabled:!selected.trim(),run:async()=>{await writeClipboard(selected);toast('已复制选中内容')}},
+    {label:'复制本条消息',disabled:!messageText,run:async()=>{await writeClipboard(messageText);toast('已复制本条消息')}},
+  ]);
+});
 const agentTerminalContextTagObserver=window.ResizeObserver?new ResizeObserver(()=>{const tag=$('#agent-terminal-context-tag');if(!tag.classList.contains('hidden'))tag.parentElement.style.setProperty('--agent-terminal-context-indent',`${tag.offsetWidth+7}px`)}):null;
 agentTerminalContextTagObserver?.observe($('#agent-terminal-context-tag'));
 function handleAgentTerminalInput(tab,data){
