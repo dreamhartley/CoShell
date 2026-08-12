@@ -30,7 +30,7 @@ from .backup import BackupError, MAX_BACKUP_BYTES, create_backup, parse_backup, 
 from .database import Database
 from .device_secrets import DeviceSecretError, protect as protect_device_secret, unprotect as unprotect_device_secret
 from .mcp import MCPError, call_tool as call_mcp_tool, list_tools as list_mcp_tools, search_tools
-from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, ChmodBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
+from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, ChmodBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, SSHKeyUpdateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
 from .searxng_backend import SearxNGService
 from .ssh import SFTP_OP_TIMEOUT, SFTP_STREAM_TIMEOUT, HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair, sftp_timeout, with_sftp_lock
 from .updater import application_info
@@ -262,7 +262,7 @@ def open_server_workspace(server_id: int):
 
 
 def public_ssh_key(row: dict[str, Any]) -> dict[str, Any]:
-    return {key: row[key] for key in ("id", "name", "key_type", "fingerprint", "created_at")}
+    return {key: row[key] for key in ("id", "name", "key_type", "fingerprint", "note", "created_at")}
 
 
 @app.get("/api/ssh-keys")
@@ -361,6 +361,22 @@ def delete_ssh_key(key_id: int):
     db.execute("UPDATE servers SET ssh_key_id=NULL WHERE ssh_key_id=?", (key_id,))
     db.execute("DELETE FROM ssh_keys WHERE id=?", (key_id,))
     return {"ok": True}
+
+
+@app.put("/api/ssh-keys/{key_id}")
+def update_ssh_key(key_id: int, body: SSHKeyUpdateBody):
+    row = db.fetchone("SELECT * FROM ssh_keys WHERE id=?", (key_id,))
+    if not row:
+        raise HTTPException(400, "密钥不存在")
+    name = body.name.strip() if body.name is not None else None
+    if name is not None:
+        if not name:
+            raise HTTPException(400, "密钥名称不能为空")
+        if db.fetchone("SELECT id FROM ssh_keys WHERE name=? AND id<>?", (name, key_id)):
+            raise HTTPException(409, "密钥名称已存在")
+    note = body.note if body.note is not None else row["note"]
+    db.execute("UPDATE ssh_keys SET name=?,note=? WHERE id=?", (name if name is not None else row["name"], note, key_id))
+    return public_ssh_key(db.fetchone("SELECT * FROM ssh_keys WHERE id=?", (key_id,)))
 
 
 @app.get("/api/shortcuts")

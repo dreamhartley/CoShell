@@ -325,6 +325,11 @@ def test_shortcuts_use_compact_rows_context_menu_and_code_editor():
     assert "function shortcutEditorNewline" in javascript
     assert "opensBlock" in javascript
     assert "keepShortcutBlankClickInView(cm)" in javascript
+    assert "function showCodeMirrorMenu" in javascript
+    assert "showCodeMirrorMenu(event,cm)" in javascript
+    assert "cm.getSelection()" in javascript
+    assert "cm.replaceSelection('')" in javascript
+    assert "const dialogs=$$('dialog[open]')" in javascript
     assert ".shortcut-row" in css
     assert ".shortcut-code-field .CodeMirror" in css
 
@@ -542,6 +547,16 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert 'mask-image:url("/static/icons/agent-full-access.svg")' in css
     assert Path("static/icons/agent-request-approval.svg").is_file()
     assert Path("static/icons/agent-full-access.svg").is_file()
+    assert "agentChatSelection" in javascript
+    assert "$('#agent-chat').addEventListener('contextmenu'" in javascript
+    assert "if(!activeTab()?.agentChat.length){event.preventDefault();return}" in javascript
+    assert "复制本条消息" in javascript
+    assert "已复制选中内容" in javascript
+    assert "已复制本条消息" in javascript
+    assert "function showAgentComposerMenu" in javascript
+    assert "$('#agent-chat-input').addEventListener('contextmenu',showAgentComposerMenu)" in javascript
+    assert "writeClipboard(selected)" in javascript
+    assert "readClipboard()" in javascript
 
 
 def test_terminal_agent_is_an_isolated_contextual_quick_fix():
@@ -593,9 +608,6 @@ def test_terminal_agent_is_an_isolated_contextual_quick_fix():
     assert 'mask:url("/static/icons/copy.svg")' in css
     assert Path("static/icons/copy.svg").is_file()
     assert "button.setAttribute('aria-label','复制此消息')" in javascript
-    assert "$('#agent-chat').addEventListener('contextmenu'" not in javascript
-    assert "复制选中内容" not in javascript
-    assert "复制整条消息" not in javascript
     assert "function renderAgentProcess" in javascript
     assert "agent-process-toggle" in css
     assert "process?.items.push(tab.agentActivity)" in javascript

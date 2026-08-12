@@ -9,6 +9,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.database import Database
@@ -16,7 +17,7 @@ from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry
 from app.vault import Vault, VaultError
 from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, trim_conversation_history, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
-from app.schemas import SSHKeyGenerateBody, ServerBody, ShortcutBody
+from app.schemas import SSHKeyBody, SSHKeyGenerateBody, SSHKeyUpdateBody, ServerBody, ShortcutBody
 from app import main as main_app
 from app.main import agent_message_with_terminal_context, agent_workspace_executor, agents, terminal_agents
 from app.agent_workspace import AgentWorkspace, MANAGED_END, MANAGED_START
@@ -158,6 +159,34 @@ def test_generate_ssh_key_saves_under_data_and_auto_imports(monkeypatch, tmp_pat
     assert automatic["file_name"].startswith("id_ed25519_")
     assert (tmp_path / "ssh-keys" / automatic["file_name"]).is_file()
     assert automatic["imported"]["name"] == automatic["name"]
+    database.close()
+
+
+def test_update_ssh_key_changes_name_and_note(monkeypatch, tmp_path):
+    database = Database(tmp_path / "webssh.db")
+    test_vault = Vault(database)
+    test_vault.initialize("test master password")
+    monkeypatch.setattr(main_app, "DATA", tmp_path)
+    monkeypatch.setattr(main_app, "db", database)
+    monkeypatch.setattr(main_app, "vault", test_vault)
+
+    private_key, _ = create_ssh_key_pair("ed25519", 3072, None, "prod key")
+    imported = main_app.import_ssh_key(SSHKeyBody(name="Prod key", private_key=private_key, passphrase=None))
+    assert imported["note"] == ""
+
+    updated = main_app.update_ssh_key(imported["id"], SSHKeyUpdateBody(name="Renamed key", note="生产环境使用"))
+    assert updated["name"] == "Renamed key"
+    assert updated["note"] == "生产环境使用"
+    row = database.fetchone("SELECT name,note FROM ssh_keys WHERE id=?", (imported["id"],))
+    assert (row["name"], row["note"]) == ("Renamed key", "生产环境使用")
+
+    main_app.import_ssh_key(SSHKeyBody(name="Another key", private_key=private_key, passphrase=None))
+    with pytest.raises(HTTPException) as exc:
+        main_app.update_ssh_key(imported["id"], SSHKeyUpdateBody(name="Another key"))
+    assert exc.value.status_code == 409
+    with pytest.raises(HTTPException) as exc:
+        main_app.update_ssh_key(99999, SSHKeyUpdateBody(note="missing"))
+    assert exc.value.status_code == 400
     database.close()
 
 

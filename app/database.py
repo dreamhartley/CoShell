@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS ssh_keys (
     fingerprint TEXT NOT NULL,
     private_key_enc BLOB NOT NULL,
     passphrase_enc BLOB,
+    note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -112,6 +113,9 @@ class Database:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(agent_settings)")}
         if "builtin_web_search" not in columns:
             self._conn.execute("ALTER TABLE agent_settings ADD COLUMN builtin_web_search INTEGER NOT NULL DEFAULT 1")
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(ssh_keys)")}
+        if "note" not in columns:
+            self._conn.execute("ALTER TABLE ssh_keys ADD COLUMN note TEXT NOT NULL DEFAULT ''")
         self._conn.commit()
 
     def execute(self, sql: str, values: Iterable[Any] = ()) -> sqlite3.Cursor:
