@@ -24,6 +24,7 @@ TABLES: dict[str, tuple[str, ...]] = {
     "settings": ("key", "value"),
     "agent_settings": ("id", "api_url", "api_key_enc", "model", "updated_at", "builtin_web_search"),
     "mcp_servers": ("id", "name", "url", "auth_token_enc", "enabled", "tools_json", "created_at", "updated_at"),
+    "agent_chats": ("id", "server_id", "title", "model", "display", "context", "created_at", "updated_at"),
 }
 
 

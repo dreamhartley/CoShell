@@ -17,7 +17,7 @@ from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry
 from app.vault import Vault, VaultError
 from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, trim_conversation_history, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
-from app.schemas import SSHKeyBody, SSHKeyGenerateBody, SSHKeyUpdateBody, ServerBody, ShortcutBody
+from app.schemas import SSHKeyBody, SSHKeyGenerateBody, SSHKeyUpdateBody, AgentChatRestoreBody, AgentChatSaveBody, ServerBody, ShortcutBody
 from app import main as main_app
 from app.main import agent_message_with_terminal_context, agent_workspace_executor, agents, terminal_agents
 from app.agent_workspace import AgentWorkspace, MANAGED_END, MANAGED_START
@@ -1386,4 +1386,143 @@ def test_changed_host_key_can_be_retrusted_and_forces_os_redetection(monkeypatch
     assert any(message["type"] == "connected" for message in websocket.sent)
     assert database.fetchone("SELECT key_base64 FROM host_keys WHERE host=? AND port=?", ("example.test", 22))["key_base64"] == changed_key.get_base64()
     assert database.fetchone("SELECT os_type FROM servers WHERE id=?", (server_id,))["os_type"] == "debian"
+    database.close()
+
+
+def test_agent_chat_history_save_list_restore_delete(monkeypatch, tmp_path):
+    database = Database(tmp_path / "webssh.db")
+    monkeypatch.setattr(main_app, "db", database)
+    monkeypatch.setattr(main_app, "_schedule_agent_chat_title", lambda _chat_id: None)
+
+    session_id = "history-test-session"
+    context = [{"role": "user", "content": "查看 nginx 状态"}, {"role": "assistant", "content": "nginx 正在运行"}]
+    main_app.agents.restore(session_id, context)
+
+    body = AgentChatSaveBody(
+        chat_id="chat-history-0001", session_id=session_id, server_id=7,
+        display=[
+            {"kind": "message", "role": "user", "text": "查看 nginx 状态"},
+            {"kind": "message", "role": "assistant", "text": "nginx 正在运行"},
+        ],
+    )
+    assert main_app.save_agent_chat(body)["ok"] is True
+
+    items = main_app.list_agent_chats(server_id=7)["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == "chat-history-0001"
+    assert items[0]["title"] == "查看 nginx 状态"  # 标题为空时回退为首条用户消息
+    assert items[0]["titled"] is False
+    assert items[0]["generating"] is False
+    assert items[0]["created_at"]
+    assert main_app.list_agent_chats(server_id=8)["items"] == []
+
+    # 再次保存不会覆盖已生成的标题
+    database.execute("UPDATE agent_chats SET title='人工标题' WHERE id='chat-history-0001'")
+    assert main_app.save_agent_chat(body)["ok"] is True
+    saved = main_app.list_agent_chats(server_id=7)["items"][0]
+    assert saved["title"] == "人工标题"
+    assert saved["titled"] is True
+
+    # 标题生成线程运行中时列表标记 generating，前端据此显示流光动画
+    with main_app._chat_title_lock:
+        main_app._chat_title_pending.add("chat-history-0001")
+    assert main_app.list_agent_chats(server_id=7)["items"][0]["generating"] is True
+    with main_app._chat_title_lock:
+        main_app._chat_title_pending.discard("chat-history-0001")
+
+    # 恢复：把持久化上下文写回 AgentRegistry 并返回展示条目
+    main_app.agents.clear(session_id)
+
+    def fake_sessions_get(session_id):
+        if session_id == "history-test-session":
+            return SimpleNamespace()
+        raise KeyError(session_id)
+
+    monkeypatch.setattr(main_app.sessions, "get", fake_sessions_get)
+    restored = main_app.restore_agent_chat("chat-history-0001", AgentChatRestoreBody(session_id=session_id))
+    assert restored["title"] == "人工标题"
+    assert restored["display"][0]["text"] == "查看 nginx 状态"
+    assert main_app.agents.messages(session_id) == context
+
+    with pytest.raises(HTTPException) as exc:
+        main_app.restore_agent_chat("chat-history-0001", AgentChatRestoreBody(session_id="missing-session"))
+    assert exc.value.status_code == 404
+    with pytest.raises(HTTPException) as exc:
+        main_app.restore_agent_chat("chat-missing", AgentChatRestoreBody(session_id=session_id))
+    assert exc.value.status_code == 404
+
+    assert main_app.delete_agent_chat("chat-history-0001")["ok"] is True
+    assert main_app.list_agent_chats(server_id=7)["items"] == []
+    main_app.agents.clear(session_id)
+    database.close()
+
+
+def test_agent_chat_title_generation_and_fallback(monkeypatch, tmp_path):
+    database = Database(tmp_path / "webssh.db")
+    monkeypatch.setattr(main_app, "db", database)
+    database.execute(
+        "INSERT INTO agent_chats (id,server_id,title,model,display,context,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("chat-title-0001", 3, "", "test-model",
+         json.dumps([
+             {"kind": "message", "role": "user", "text": "服务器磁盘满了怎么办"},
+             {"kind": "message", "role": "assistant", "text": "可以清理日志并扩容"},
+         ], ensure_ascii=False),
+         "[]", "2026-08-16 10:00:00", "2026-08-16 10:00:00"),
+    )
+    database.execute(
+        "INSERT INTO agent_chats (id,server_id,title,model,display,context,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("chat-title-0002", 3, "", "glm-5.2",
+         json.dumps([{"kind": "message", "role": "user", "text": "帮我看看服务器的内存占用情况并给出清理建议"}], ensure_ascii=False),
+         "[]", "2026-08-16 10:00:00", "2026-08-16 10:00:00"),
+    )
+
+    calls = []
+
+    def fake_openai_request(base_url, api_key, resource, *, method="GET", payload=None, timeout=60):
+        calls.append({"resource": resource, "method": method, "payload": payload})
+        # 模拟思考型模型：思考内容与正式回答分开返回
+        return {"choices": [{"message": {"reasoning_content": "让我想想……这是一个磁盘问题……", "content": "\"排查磁盘空间不足\"。"}}]}
+
+    monkeypatch.setattr(main_app, "openai_request", fake_openai_request)
+    monkeypatch.setattr(main_app, "agent_setting_row", lambda: {"api_url": "https://api.test/v1", "model": "test-model"})
+    monkeypatch.setattr(main_app, "agent_api_key", lambda provided=None: "key")
+
+    main_app._generate_agent_chat_title("chat-title-0001")
+    assert calls[0]["resource"] == "chat/completions"
+    assert calls[0]["method"] == "POST"  # 缺省 GET 会被网关拒绝，标题从未生成成功的直接原因
+    assert calls[0]["payload"]["model"] == "test-model"
+    assert calls[0]["payload"]["max_tokens"] == 4096
+    assert "thinking" not in calls[0]["payload"]  # 不尝试关闭思考：通用兼容，只丢弃思考内容
+    row = database.fetchone("SELECT title FROM agent_chats WHERE id='chat-title-0001'")
+    assert row["title"] == "排查磁盘空间不足"  # 思考内容被丢弃，仅取正式回答
+
+    # GLM 等思考默认开启的模型同样不附加思考参数，仅靠解析 content 兼容
+    monkeypatch.setattr(main_app, "agent_setting_row", lambda: {"api_url": "https://api.test/v1", "model": "glm-5.2"})
+    main_app._generate_agent_chat_title("chat-title-0002")
+    assert "thinking" not in calls[1]["payload"]
+
+    # 生成失败时保留空标题（列表动态回退为首条用户消息预览），不把回退值写死
+    database.execute(
+        "INSERT INTO agent_chats (id,server_id,title,model,display,context,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("chat-title-0003", 3, "", "test-model",
+         json.dumps([{"kind": "message", "role": "user", "text": "帮我看看服务器的内存占用情况并给出清理建议"}], ensure_ascii=False),
+         "[]", "2026-08-16 10:00:00", "2026-08-16 10:00:00"),
+    )
+    monkeypatch.setattr(main_app, "agent_setting_row", lambda: None)
+    main_app._generate_agent_chat_title("chat-title-0003")
+    row = database.fetchone("SELECT title FROM agent_chats WHERE id='chat-title-0003'")
+    assert row["title"] == ""
+    items = main_app.list_agent_chats(server_id=3)["items"]
+    preview = next(item for item in items if item["id"] == "chat-title-0003")
+    assert preview["title"] == "帮我看看服务器的内存占用情况并给出清理建…"
+
+    # 重试次数用尽后不再调度生成线程
+    main_app._chat_title_attempts["chat-title-0003"] = main_app.CHAT_TITLE_MAX_ATTEMPTS
+    main_app._schedule_agent_chat_title("chat-title-0003")
+    assert main_app._chat_title_attempts["chat-title-0003"] == main_app.CHAT_TITLE_MAX_ATTEMPTS
+    assert len(calls) == 2
+
+    for chat_id in ("chat-title-0001", "chat-title-0002", "chat-title-0003"):
+        main_app._chat_title_attempts.pop(chat_id, None)
+        main_app._chat_title_pending.discard(chat_id)
     database.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import html
 import json
 import ipaddress
@@ -659,6 +660,23 @@ class AgentRegistry:
     def clear(self, session_id: str) -> None:
         with self._lock:
             self._items.pop(session_id, None)
+
+    def messages(self, session_id: str) -> list[dict[str, Any]] | None:
+        """Return a deep copy of a conversation's message history (without system prompt)."""
+        with self._lock:
+            conversation = self._items.get(session_id)
+            if conversation is None:
+                return None
+            with conversation.lock:
+                return copy.deepcopy(conversation.messages)
+
+    def restore(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        """Replace a conversation's history with previously persisted messages."""
+        restored = [copy.deepcopy(item) for item in messages if isinstance(item, dict)]
+        with self._lock:
+            conversation = self._items.setdefault(session_id, AgentConversation())
+        with conversation.lock:
+            conversation.messages = restored
 
     def chat(
         self, session_id: str, text: str, base_url: str, api_key: str, model: str,

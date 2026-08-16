@@ -41,7 +41,8 @@
         <div class="agent-panel-head">
           <div class="agent-panel-title"><strong>Agent</strong><span id="agent-session-label">未连接终端</span></div>
           <div class="agent-panel-actions">
-            <button id="agent-new-chat" class="icon-btn" type="button" title="新建对话">＋</button>
+            <button id="agent-history" class="icon-btn" type="button" title="历史会话" aria-label="历史会话" aria-haspopup="dialog"><span class="agent-history-icon" aria-hidden="true"></span></button>
+            <button id="agent-new-chat" class="icon-btn" type="button" title="新建会话" aria-label="新建会话"><span class="agent-new-chat-icon" aria-hidden="true"></span></button>
           </div>
         </div>
         <div id="agent-chat" class="agent-chat" aria-live="polite">
@@ -303,6 +304,11 @@
       <div id="app-prompt-options" class="app-prompt-options hidden"></div>
       <div class="dialog-actions"><button id="app-prompt-cancel" type="button">取消</button><button id="app-prompt-submit" class="primary" type="submit">确认</button></div>
     </form>
+  </dialog>
+  <dialog id="agent-history-dialog" class="agent-history-dialog" aria-labelledby="agent-history-title">
+    <div class="dialog-title"><h2 id="agent-history-title">历史会话</h2><button type="button" class="icon-btn dialog-close" aria-label="关闭">×</button></div>
+    <p id="agent-history-subtitle" class="agent-history-subtitle">当前服务器的历史会话</p>
+    <div id="agent-history-list" class="agent-history-list" role="listbox" aria-label="历史会话列表"></div>
   </dialog>
   <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
   <script src="/static/vendor/xterm.js"></script>

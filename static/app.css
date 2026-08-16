@@ -129,3 +129,26 @@ dialog::backdrop{background:#1b10238f;backdrop-filter:blur(4px)}
 .settings-vault-toggle{display:inline-flex;flex:none;align-items:center;gap:6px;font-size:12px;white-space:nowrap}
 .settings-vault-toggle::after{content:"";width:14px;height:14px;background:currentColor;mask:url("/static/icons/vault-locked.svg") center/contain no-repeat;-webkit-mask:url("/static/icons/vault-locked.svg") center/contain no-repeat}
 .settings-vault-toggle.unlocked::after{mask-image:url("/static/icons/vault-unlocked.svg");-webkit-mask-image:url("/static/icons/vault-unlocked.svg")}
+
+/* --- Agent 历史会话 --- */
+.agent-history-icon{display:block;width:16px;height:16px;background:currentColor;mask:url("/static/icons/history.svg") center/contain no-repeat;-webkit-mask:url("/static/icons/history.svg") center/contain no-repeat}
+.agent-new-chat-icon{display:block;width:16px;height:16px;background:currentColor;mask:url("/static/icons/plus.svg") center/contain no-repeat;-webkit-mask:url("/static/icons/plus.svg") center/contain no-repeat}
+.agent-panel-actions .icon-btn:disabled{cursor:not-allowed;opacity:.45}
+.agent-history-dialog{width:min(460px,calc(100vw - 28px));padding:16px 18px}
+.agent-history-subtitle{margin:0 0 10px;color:var(--muted);font-size:12px}
+.agent-history-list{display:flex;max-height:min(420px,55vh);flex-direction:column;gap:6px;overflow:auto;padding-right:2px}
+.agent-history-item{display:flex;align-items:center;gap:8px;padding:9px 10px;border:1px solid var(--border);border-radius:9px;background:var(--panel2);cursor:pointer}
+.agent-history-item:hover,.agent-history-item:focus-visible{border-color:color-mix(in srgb,var(--accent) 45%,var(--border));background:var(--hover)}
+.agent-history-item.current{border-color:color-mix(in srgb,var(--accent) 55%,var(--border))}
+.agent-history-main{display:flex;min-width:0;flex:1;flex-direction:column;gap:3px}
+.agent-history-title-row{display:flex;min-width:0;align-items:center;gap:6px}
+.agent-history-item-title{min-width:0;overflow:hidden;color:var(--text);font-weight:600;text-overflow:ellipsis;white-space:nowrap}
+.agent-history-item-title.pending{border-radius:5px;color:var(--muted);background:linear-gradient(100deg,transparent 25%,color-mix(in srgb,var(--accent) 18%,transparent) 50%,transparent 75%);background-size:220% 100%;animation:agent-flow 1.8s linear infinite}
+.agent-history-badge{flex:none;padding:1px 6px;border:1px solid color-mix(in srgb,var(--accent) 40%,var(--border));border-radius:6px;background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);font-size:10px;font-weight:500}
+.agent-history-item-meta{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px}
+.agent-history-model{max-width:50%;overflow:hidden;padding:1px 6px;border-radius:5px;background:color-mix(in srgb,var(--panel) 55%,transparent);text-overflow:ellipsis;white-space:nowrap}
+.agent-history-time{flex:none}
+.agent-history-delete{display:grid;flex:none;width:26px;height:26px;place-items:center;padding:0;border:0;border-radius:7px;background:transparent;color:var(--muted)}
+.agent-history-delete::before{content:"";width:14px;height:14px;background:currentColor;mask:url("/static/icons/trash.svg") center/contain no-repeat;-webkit-mask:url("/static/icons/trash.svg") center/contain no-repeat}
+.agent-history-delete:hover{background:color-mix(in srgb,var(--danger) 14%,transparent);color:var(--danger)}
+.agent-history-empty{padding:26px 10px;color:var(--muted);text-align:center}

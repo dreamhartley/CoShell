@@ -23,14 +23,14 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, list_models
+from .agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, list_models, openai_request
 from .agent_permissions import AgentApprovalRegistry, classify_dangerous_command
 from .agent_workspace import AgentWorkspace
 from .backup import BackupError, MAX_BACKUP_BYTES, create_backup, parse_backup, restore_backup
 from .database import Database
 from .device_secrets import DeviceSecretError, protect as protect_device_secret, unprotect as unprotect_device_secret
 from .mcp import MCPError, call_tool as call_mcp_tool, list_tools as list_mcp_tools, search_tools
-from .schemas import AgentApprovalBody, AgentChatBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, ChmodBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, SSHKeyUpdateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
+from .schemas import AgentApprovalBody, AgentChatBody, AgentChatRestoreBody, AgentChatSaveBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, ChmodBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, SSHKeyUpdateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
 from .searxng_backend import SearxNGService
 from .ssh import SFTP_OP_TIMEOUT, SFTP_STREAM_TIMEOUT, HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair, sftp_timeout, with_sftp_lock
 from .updater import application_info
@@ -823,6 +823,176 @@ async def agent_chat_stream(body: AgentChatBody):
 def agent_chat_reset(body: AgentSessionBody):
     agent_approvals.cancel_session(body.session_id, "sidebar")
     agents.clear(body.session_id)
+    return {"ok": True}
+
+
+CHAT_TITLE_SYSTEM_PROMPT = (
+    "你是聊天标题生成器。根据用户与助手的对话内容，生成一个不超过16个字的简短中文标题，概括对话主题。"
+    "只输出标题本身，不要使用引号或以标点结尾，不要输出任何解释。"
+)
+AGENT_CHAT_MAX_DISPLAY_BYTES = 4 * 1024 * 1024
+CHAT_TITLE_MAX_ATTEMPTS = 3
+# 思考型模型默认开启思考且多数无法关闭：允许其思考并丢弃 reasoning_content，
+# max_tokens 需容纳思考+标题，超时与流式请求（openai_stream_request）保持一致。
+CHAT_TITLE_MAX_TOKENS = 4096
+CHAT_TITLE_TIMEOUT = 90
+_chat_title_lock = threading.Lock()
+_chat_title_pending: set[str] = set()
+_chat_title_attempts: dict[str, int] = {}
+
+
+def _chat_json_entries(payload_json: str) -> list[dict[str, Any]]:
+    try:
+        entries = json.loads(payload_json) if payload_json else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+
+def _chat_display_preview(display_json: str) -> str:
+    """Fallback history title: the leading 20 chars of the first user message."""
+    for entry in _chat_json_entries(display_json):
+        if entry.get("kind") == "message" and entry.get("role") == "user":
+            text = " ".join(str(entry.get("text") or "").split())
+            return text[:20] + ("…" if len(text) > 20 else "")
+    return "新会话"
+
+
+def _generate_agent_chat_title(chat_id: str) -> None:
+    """Generate a short chat title with the currently configured model.
+
+    生成失败时保留空标题（列表端点会动态回退为首条用户消息预览），
+    后续保存/恢复可重试，避免把回退值永久写死在 title 里。
+    """
+    try:
+        row = db.fetchone("SELECT title, display FROM agent_chats WHERE id=?", (chat_id,))
+        if not row or (row["title"] or "").strip():
+            return
+        first_user, first_answer = "", ""
+        for entry in _chat_json_entries(row["display"] or "[]"):
+            if entry.get("kind") != "message":
+                continue
+            if entry.get("role") == "user" and not first_user:
+                first_user = str(entry.get("text") or "")[:1000]
+            elif entry.get("role") == "assistant" and not entry.get("error") and not first_answer:
+                first_answer = str(entry.get("text") or "")[:1000]
+            if first_user and first_answer:
+                break
+        title = ""
+        try:
+            config = agent_setting_row()
+            if not config or not str(config.get("model") or "").strip():
+                raise AgentError("未选择模型")
+            payload = {
+                "model": config["model"],
+                "messages": [
+                    {"role": "system", "content": CHAT_TITLE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"用户：{first_user}\n\n助手：{first_answer}"},
+                ],
+                "temperature": 0.2,
+                "max_tokens": CHAT_TITLE_MAX_TOKENS,
+            }
+            data = openai_request(config["api_url"], agent_api_key(), "chat/completions", method="POST", payload=payload, timeout=CHAT_TITLE_TIMEOUT)
+            choices = data.get("choices") or []
+            message = (choices[0].get("message") or {}) if choices else {}
+            # 思考内容位于 reasoning_content/reasoning，标题只取正式回答 content
+            content = str(message.get("content") or "")
+            lines = content.strip().splitlines()
+            title = lines[0].rstrip("。.！!？? ").strip("\"'“”‘’「」《》").strip() if lines else ""
+        except Exception as exc:
+            print(f"[agent-chats] 会话标题生成失败（{chat_id}）：{exc}", flush=True)
+            title = ""
+        if title:
+            # 仅在尚未生成标题时写入，避免覆盖并发保存期间已产生的结果
+            db.execute("UPDATE agent_chats SET title=? WHERE id=? AND title=''", (title[:30], chat_id))
+            with _chat_title_lock:
+                _chat_title_attempts.pop(chat_id, None)
+    finally:
+        with _chat_title_lock:
+            _chat_title_pending.discard(chat_id)
+
+
+def _schedule_agent_chat_title(chat_id: str) -> None:
+    """Spawn the title generation thread unless it is running, done, or out of retries."""
+    row = db.fetchone("SELECT title FROM agent_chats WHERE id=?", (chat_id,))
+    if not row or (row["title"] or "").strip():
+        return
+    with _chat_title_lock:
+        attempts = _chat_title_attempts.get(chat_id, 0)
+        if attempts >= CHAT_TITLE_MAX_ATTEMPTS or chat_id in _chat_title_pending:
+            return
+        _chat_title_attempts[chat_id] = attempts + 1
+        _chat_title_pending.add(chat_id)
+    threading.Thread(target=_generate_agent_chat_title, args=(chat_id,), daemon=True,
+                     name=f"chat-title-{chat_id[:8]}").start()
+
+
+@app.get("/api/agent/chats")
+def list_agent_chats(server_id: int = 0):
+    rows = db.fetchall(
+        "SELECT id, title, model, display, created_at, updated_at FROM agent_chats WHERE server_id=? ORDER BY updated_at DESC, created_at DESC",
+        (server_id,),
+    )
+    with _chat_title_lock:
+        generating = set(_chat_title_pending)
+    items = []
+    for row in rows:
+        title = (row["title"] or "").strip()
+        items.append({
+            "id": row["id"],
+            "title": title or _chat_display_preview(row["display"]),
+            "titled": bool(title),
+            "generating": row["id"] in generating,
+            "model": row["model"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+    return {"items": items}
+
+
+@app.put("/api/agent/chats")
+def save_agent_chat(body: AgentChatSaveBody):
+    display_json = json.dumps(body.display, ensure_ascii=False, separators=(",", ":"))
+    if len(display_json.encode("utf-8")) > AGENT_CHAT_MAX_DISPLAY_BYTES:
+        raise HTTPException(413, "会话内容过大，无法保存到历史记录")
+    context_json = json.dumps(agents.messages(body.session_id) or [], ensure_ascii=False, separators=(",", ":"))
+    config = agent_setting_row()
+    existing = db.fetchone("SELECT title FROM agent_chats WHERE id=?", (body.chat_id,))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute(
+        "INSERT INTO agent_chats (id, server_id, title, model, display, context, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET server_id=excluded.server_id, model=excluded.model, display=excluded.display, "
+        "context=excluded.context, updated_at=excluded.updated_at",
+        (body.chat_id, body.server_id, (existing["title"] if existing else "") or "", config["model"] if config else "",
+         display_json, context_json, now, now),
+    )
+    _schedule_agent_chat_title(body.chat_id)
+    return {"ok": True}
+
+
+@app.post("/api/agent/chats/{chat_id}/restore")
+def restore_agent_chat(chat_id: str, body: AgentChatRestoreBody):
+    try:
+        sessions.get(body.session_id)
+    except KeyError as exc:
+        raise HTTPException(404, "终端会话不存在，请先连接服务器") from exc
+    row = db.fetchone("SELECT title, model, display, context FROM agent_chats WHERE id=?", (chat_id,))
+    if not row:
+        raise HTTPException(404, "历史会话不存在或已被删除")
+    agents.restore(body.session_id, _chat_json_entries(row["context"] or "[]"))
+    # 历史上生成失败（标题仍为空）的会话在恢复时补一次生成机会
+    _schedule_agent_chat_title(chat_id)
+    return {
+        "id": chat_id,
+        "title": (row["title"] or "").strip() or _chat_display_preview(row["display"] or "[]"),
+        "model": row["model"],
+        "display": _chat_json_entries(row["display"] or "[]"),
+    }
+
+
+@app.delete("/api/agent/chats/{chat_id}")
+def delete_agent_chat(chat_id: str):
+    db.execute("DELETE FROM agent_chats WHERE id=?", (chat_id,))
     return {"ok": True}
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -137,6 +137,17 @@ class TerminalAgentBody(BaseModel):
 
 
 class AgentSessionBody(BaseModel):
+    session_id: str
+
+
+class AgentChatSaveBody(BaseModel):
+    chat_id: str = Field(min_length=8, max_length=64)
+    session_id: str
+    server_id: int = 0
+    display: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
+
+
+class AgentChatRestoreBody(BaseModel):
     session_id: str
 
 
