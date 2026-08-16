@@ -678,7 +678,9 @@ def test_agent_retries_transient_request_errors(monkeypatch):
     assert result["message"] == "网络恢复，任务继续"
     retries = [event for event in events if event["type"] == "activity" and event["activity"] == "retry"]
     assert len(retries) == 2
-    assert retries[0]["label"].startswith("第 1/10 次")
+    assert [event["attempt"] for event in retries] == [1, 2]
+    assert retries[0]["label"] == "第 1/10 次"
+    assert "连接超时" not in retries[0]["label"]  # 逐次重试不携带报错详情
 
 
 def test_retry_delay_grows_then_stays_capped():

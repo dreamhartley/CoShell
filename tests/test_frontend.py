@@ -522,6 +522,13 @@ def test_agent_sidebar_has_streaming_chat_and_keeps_answers_out_of_terminal():
     assert "event.type==='answer')tab.term" not in javascript
     assert "event.type==='answer_delta'" in javascript
     assert "process.currentText.text+=event.delta" in javascript
+    assert "function settleAgentRetry" in javascript
+    assert "event.activity==='retry'" in javascript
+    assert "process.retryItem={type:'retry',status:'running',count,text:`正在重试（${count}）`}" in javascript
+    assert "重试失败（共 ${item.count} 次）" in javascript
+    assert "重试成功（共 ${item.count} 次）" in javascript
+    assert "settleAgentRetry(process,status);if(tab.agentProcessTimer)" in javascript
+    assert ".agent-command.running,.agent-retry.running{" in css
     assert "renderAgentChatMarkdown(entry.text)" in javascript
     assert ".agent-message.user{width:auto;max-width:85%;align-self:flex-end;padding:9px 12px" in css
     assert ".agent-message.assistant{align-self:stretch;padding:4px 2px;background:transparent" in css

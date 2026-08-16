@@ -244,7 +244,12 @@ def _chat_completion_request(
             if on_event:
                 on_event({"type": "answer_cancel"})
                 on_event({"type": "thinking_end"})
-                on_event({"type": "activity", "activity": "retry", "label": f"第 {attempt}/{MAX_REQUEST_ATTEMPTS} 次：{exc}"})
+                # 详细报错只保留在最终失败信息里，逐次重试仅上报次数，避免界面上刷屏。
+                on_event({
+                    "type": "activity", "activity": "retry",
+                    "label": f"第 {attempt}/{MAX_REQUEST_ATTEMPTS} 次",
+                    "attempt": attempt, "max_attempts": MAX_REQUEST_ATTEMPTS,
+                })
             time.sleep(_retry_delay_seconds(attempt))
             if cancel_event and cancel_event.is_set():
                 raise AgentCancelled("Agent 任务已停止")
