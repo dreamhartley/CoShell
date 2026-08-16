@@ -146,7 +146,7 @@
         <button type="button" class="settings-tab" data-settings-panel="update">更新</button>
       </nav>
       <section id="settings-vault" class="settings-panel active">
-        <div class="setting-summary"><div><strong>凭据保险库</strong><p id="settings-vault-status" class="muted"></p></div><span id="settings-vault-indicator" class="status-pill"></span></div>
+        <div class="setting-summary"><div><strong>凭据保险库</strong><p id="settings-vault-status" class="muted"></p></div><button id="settings-vault-toggle" type="button" class="settings-vault-toggle primary">解锁</button></div>
         <p class="muted">服务器密码、私钥以及 Agent API 密钥均使用主密码派生的密钥加密保存。</p>
         <div class="settings-section-title"><strong>SSH 私钥</strong><span class="settings-section-actions"><button id="ssh-key-generate-toggle" type="button" class="primary">生成密钥</button><button id="ssh-key-import-toggle" type="button">导入密钥</button></span></div>
         <form id="ssh-key-generate-form" class="nested-form hidden" autocomplete="off">
@@ -166,7 +166,6 @@
           <div class="dialog-actions"><button type="button" id="ssh-key-import-cancel">取消</button><button class="primary" type="submit">加密导入</button></div>
         </form>
         <div id="ssh-key-list" class="settings-list"></div>
-        <div class="dialog-actions"><button id="settings-vault-lock" type="button" class="danger">锁定</button><button id="settings-vault-unlock" type="button" class="primary">解锁 / 初始化</button></div>
       </section>
       <form id="agent-settings-form" class="settings-panel" autocomplete="off">
         <label>API 地址<input name="api_url" type="url" required placeholder="https://api.openai.com/v1"></label>

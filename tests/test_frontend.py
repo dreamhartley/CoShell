@@ -58,6 +58,25 @@ def test_theme_picker_exposes_all_themes_and_removes_quick_toggle():
         assert f':root[data-theme="{theme}"]' in css
 
 
+def test_settings_vault_merges_lock_unlock_into_summary_button():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+
+    summary_line = next(line for line in html.splitlines() if 'id="settings-vault-status"' in line)
+    assert 'id="settings-vault-toggle"' in summary_line
+    assert "settings-vault-lock" not in html
+    assert "settings-vault-unlock" not in html
+    assert "settings-vault-indicator" not in html
+    assert "toggle.textContent=unlocked?'锁定':initialized?'解锁':'初始化'" in javascript
+    assert "toggle.classList.toggle('unlocked',unlocked)" in javascript
+    assert "if(!state.vault?.vault_unlocked)return openVault()" in javascript
+    assert '.settings-vault-toggle.unlocked::after{mask-image:url("/static/icons/vault-unlocked.svg")' in css
+    assert 'mask:url("/static/icons/vault-locked.svg")' in css
+    assert Path("static/icons/vault-locked.svg").is_file()
+    assert Path("static/icons/vault-unlocked.svg").is_file()
+
+
 def test_settings_exposes_backup_and_restore_controls():
     html = Path("static/index.html").read_text(encoding="utf-8")
     javascript = Path("static/app.js").read_text(encoding="utf-8")
