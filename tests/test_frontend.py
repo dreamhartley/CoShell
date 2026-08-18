@@ -128,6 +128,20 @@ def test_settings_can_generate_and_optionally_import_ssh_key_pair():
     assert "'/api/ssh-keys/generate'" in javascript
 
 
+def test_ssh_key_list_uses_icon_edit_and_delete_buttons():
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+
+    assert '<button class="ssh-key-edit" title="编辑密钥" aria-label="编辑密钥"></button>' in javascript
+    assert '<button class="ssh-key-delete" title="删除密钥" aria-label="删除密钥"></button>' in javascript
+    assert "$('.ssh-key-edit',row).onclick" in javascript
+    assert "$('.ssh-key-delete',row).onclick" in javascript
+    assert '<button class="edit">' not in javascript
+    assert '.ssh-key-edit::before{mask:url("/static/icons/edit.svg")' in css
+    assert '.ssh-key-delete::before{mask:url("/static/icons/trash.svg")' in css
+    assert Path("static/icons/edit.svg").is_file()
+
+
 def test_frontend_uses_themed_prompts_instead_of_browser_dialogs():
     html = Path("static/index.html").read_text(encoding="utf-8")
     javascript = Path("static/app.js").read_text(encoding="utf-8")
