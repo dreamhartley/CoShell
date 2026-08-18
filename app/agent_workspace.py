@@ -8,11 +8,19 @@ import posixpath
 import secrets
 import shutil
 import stat
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .ssh import SFTP_STREAM_TIMEOUT, SSHSession, clean_remote_path, sftp_timeout
+from .ssh import (
+    SFTP_STREAM_TIMEOUT,
+    TRANSFER_PREFETCH_REQUESTS,
+    SSHSession,
+    clean_remote_path,
+    open_transfer_client,
+    sftp_timeout,
+)
 
 
 MAX_WORKSPACE_TEXT = 256 * 1024
@@ -411,16 +419,29 @@ class AgentWorkspace:
         temporary = local.with_name(f".{local.name}.agent-{secrets.token_hex(6)}.tmp")
         written = 0
         try:
-            # See _upload: the transfer must hold the per-session SFTP lock and
-            # run with the stream timeout.
-            with session.sftp_lock, sftp_timeout(session, SFTP_STREAM_TIMEOUT):
-                sftp = session.sftp
+            with ExitStack() as stack:
+                # 优先用独立 SFTP 通道：下载期间不占用共享会话锁，文件面板保持
+                # 可用。服务器拒绝额外会话时回退共享会话，保持原有锁与流超时。
+                transfer = stack.enter_context(open_transfer_client(session))
+                if transfer is None:
+                    stack.enter_context(session.sftp_lock)
+                    stack.enter_context(sftp_timeout(session, SFTP_STREAM_TIMEOUT))
+                    sftp = session.sftp
+                else:
+                    sftp = transfer
                 info = sftp.stat(remote)
                 if stat.S_ISDIR(info.st_mode):
                     raise IsADirectoryError("Agent SFTP 暂不支持传输目录")
                 if info.st_size > MAX_SFTP_TRANSFER:
                     raise ValueError("Agent SFTP 单个文件不能超过 512 MiB")
                 with sftp.open(remote, "rb") as source, temporary.open("xb") as destination:
+                    # 串行 read 每个请求上限 32 KiB 且逐次等响应，高延迟链路上
+                    # 吞吐被钉死在 32 KiB/RTT；prefetch 用后台线程并发发异步
+                    # READ 打满带宽（paramiko 官方 get() 的默认行为）。
+                    try:
+                        source.prefetch(info.st_size, TRANSFER_PREFETCH_REQUESTS)
+                    except Exception:
+                        pass
                     while chunk := source.read(TRANSFER_CHUNK):
                         destination.write(chunk)
                         written += len(chunk)

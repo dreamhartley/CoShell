@@ -32,7 +32,7 @@ from .device_secrets import DeviceSecretError, protect as protect_device_secret,
 from .mcp import MCPError, call_tool as call_mcp_tool, list_tools as list_mcp_tools, search_tools
 from .schemas import AgentApprovalBody, AgentChatBody, AgentChatRestoreBody, AgentChatSaveBody, AgentModelsBody, AgentSessionBody, AgentSettingsBody, ChmodBody, EditorSaveBody, MCPEnabledBody, MCPServerBody, PasswordBody, PathBody, SSHKeyBody, SSHKeyGenerateBody, SSHKeyUpdateBody, ServerBody, ShortcutBody, TabBody, TerminalAgentBody, TransferBody, TrustBody, UploadInitBody
 from .searxng_backend import SearxNGService
-from .ssh import SFTP_OP_TIMEOUT, SFTP_STREAM_TIMEOUT, HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair, sftp_timeout, with_sftp_lock
+from .ssh import SFTP_OP_TIMEOUT, SFTP_STREAM_TIMEOUT, TRANSFER_PREFETCH_REQUESTS, DownloadRegistry, HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, clean_remote_path, copy_recursive, create_ssh_key_pair, detect_remote_os, file_info, parse_private_key, remove_recursive, save_ssh_key_pair, sftp_timeout, with_sftp_lock
 from .updater import application_info
 from .vault import Vault, VaultError
 
@@ -45,6 +45,7 @@ db = Database(DATA / "webssh.db")
 vault = Vault(db)
 sessions = SessionRegistry(db)
 uploads = UploadRegistry()
+downloads = DownloadRegistry()
 agents = AgentRegistry()
 terminal_agents = AgentRegistry()
 agent_approvals = AgentApprovalRegistry()
@@ -1373,47 +1374,120 @@ def upload_abort(upload_id: str):
 def sftp_download(session_id: str, path: str, request: Request):
     path = clean_remote_path(path)
     session = sftp_for(session_id)
-    try:
-        with session.sftp_lock:
-            remote = session.sftp.open(path, "rb")
-    except OSError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException) as exc:
-        drop_session(session)
-        raise HTTPException(410, "SSH 会话已断开，请重新连接") from exc
-    name = posixpath.basename(path).replace('"', "")
-    if request.method == "HEAD":
-        # 前端用 HEAD 预检下载可用性：只验证打开成功，不流式传输
-        with session.sftp_lock:
+    download: paramiko.SFTPClient | None = None
+    remote: paramiko.SFTPFile | None = None
+
+    def close_transfer() -> None:
+        if remote is None:
+            return
+        if download is not None:
+            # 通道即将销毁：用短超时约束 teardown，避免死链路上悬挂过久。
+            try:
+                download.sock.settimeout(SFTP_OP_TIMEOUT)
+            except Exception:
+                pass
             try:
                 remote.close()
             except Exception:
                 pass
-        return Response(headers={"Content-Disposition": f'attachment; filename="{name}"'})
-
-    def chunks() -> Iterator[bytes]:
-        # Lock per chunk (not for the whole stream) so browsing and other file
-        # operations keep working while a large download is in flight. Long
-        # transfers use the stream timeout: slow-but-alive links must not be
-        # killed by the quick-op bound.
-        try:
-            while True:
-                with session.sftp_lock, sftp_timeout(session, SFTP_STREAM_TIMEOUT):
-                    data = remote.read(1024 * 256)
-                if not data:
-                    break
-                yield data
-        except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException):
-            drop_session(session)
-            raise
-        finally:
+            try:
+                download.close()
+            except Exception:
+                pass
+        else:
             with session.sftp_lock:
                 try:
                     remote.close()
                 except Exception:
                     pass
 
+    try:
+        # 下载尽量独占一条新的 SFTP 通道：请求窗口与共享会话隔离，大文件
+        # 传输不再逐块抢 sftp_lock（文件面板保持可用），也能安全启用
+        # prefetch 并发读取。服务器拒绝额外会话时回退共享会话，保留原有
+        # 逐块加锁的串行读法。
+        try:
+            download = session.client.open_sftp()
+            download.sock.settimeout(SFTP_STREAM_TIMEOUT)
+        except Exception:
+            download = None
+        if download is not None:
+            remote = download.open(path, "rb")
+        else:
+            with session.sftp_lock:
+                remote = session.sftp.open(path, "rb")
+    except OSError as exc:
+        close_transfer()
+        raise HTTPException(400, str(exc)) from exc
+    except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException) as exc:
+        close_transfer()
+        drop_session(session)
+        raise HTTPException(410, "SSH 会话已断开，请重新连接") from exc
+    name = posixpath.basename(path).replace('"', "")
+    if request.method == "HEAD":
+        # 前端用 HEAD 预检下载可用性：只验证打开成功，不流式传输
+        close_transfer()
+        return Response(headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    size: int | None = None
+    try:
+        if download is not None:
+            size = remote.stat().st_size
+        else:
+            with session.sftp_lock:
+                size = remote.stat().st_size
+    except Exception:
+        size = None
+    task = downloads.create(session_id, path, size)
+
+    def chunks() -> Iterator[bytes]:
+        # Dedicated channel: the generator is the channel's only user, so no
+        # session lock is needed and prefetch's background reader thread is
+        # safe. Fallback path keeps lock-per-chunk so browsing and other file
+        # operations keep working while a large download is in flight; long
+        # transfers use the stream timeout so slow-but-alive links survive.
+        try:
+            if download is not None and size is not None:
+                # 串行 read 每请求上限 32 KiB 且逐次等响应，高延迟链路吞吐被
+                # 钉死在 32 KiB/RTT；prefetch 用并发异步 READ 打满带宽。
+                try:
+                    remote.prefetch(size, TRANSFER_PREFETCH_REQUESTS)
+                except Exception:
+                    pass
+            while True:
+                if download is not None:
+                    data = remote.read(1024 * 256)
+                else:
+                    with session.sftp_lock, sftp_timeout(session, SFTP_STREAM_TIMEOUT):
+                        data = remote.read(1024 * 256)
+                if not data:
+                    break
+                downloads.advance(task, len(data))
+                yield data
+            downloads.finish(task)
+        except (socket.timeout, EOFError, paramiko.SFTPError, paramiko.SSHException):
+            downloads.finish(task, "连接已断开")
+            drop_session(session)
+            raise
+        except OSError as exc:
+            downloads.finish(task, str(exc) or "下载失败")
+            raise
+        finally:
+            # 客户端中途断开（生成器被关闭）时任务仍是 active，标记为已取消。
+            downloads.finish(task, "已取消")
+            close_transfer()
+
     return StreamingResponse(chunks(), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@app.get("/api/sftp/downloads")
+def sftp_download_progress(session_id: str | None = None):
+    """下载中心轮询：返回进行中与最近完成的浏览器下载任务。
+
+    Agent 的 SFTP 传输不经过 /api/sftp/download，不会出现在这里——
+    其进度由 agent 工作流自身展示。
+    """
+    return {"tasks": downloads.list(session_id)}
 
 
 @app.get("/api/sftp/editor")
@@ -1427,6 +1501,12 @@ def editor_read(session_id: str, path: str):
             if info.st_size > 5 * 1024 * 1024:
                 raise HTTPException(413, "在线编辑器仅支持不超过 5 MiB 的文本文件")
             with sftp.open(path, "rb") as remote:
+                # read() 全量读取内部按 8 KiB 串行请求，高延迟链路慢一个
+                # 数量级；prefetch 并发预取后再从缓冲顺序读出。
+                try:
+                    remote.prefetch(info.st_size, TRANSFER_PREFETCH_REQUESTS)
+                except Exception:
+                    pass
                 data = remote.read()
         if b"\x00" in data:
             raise HTTPException(415, "检测到二进制内容，无法作为文本编辑")

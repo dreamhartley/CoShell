@@ -29,6 +29,8 @@ SFTP_OP_TIMEOUT = 60
 # packets: the channel timeout is a no-data detector, and firing it mid-packet
 # corrupts the SFTP response stream, so slow-but-alive links must never hit it.
 SFTP_STREAM_TIMEOUT = 600
+# Prefetch 并发异步 READ 请求的上限，与 OpenSSH sftp-server 的内部窗口一致。
+TRANSFER_PREFETCH_REQUESTS = 64
 
 
 class HostKeyRequired(Exception):
@@ -283,6 +285,29 @@ def with_sftp_lock(session: SSHSession, fn: Callable[..., Any], *args: Any, time
         return fn(*args, **kwargs)
 
 
+@contextmanager
+def open_transfer_client(session: SSHSession) -> Iterator[paramiko.SFTPClient | None]:
+    """Open a dedicated SFTP channel for one long transfer.
+
+    独立通道的请求窗口与共享 sftp 会话互不影响：大文件传输不必长期持有
+    sftp_lock（文件面板保持可用），也可以安全配合 prefetch 并发读取。
+    服务器拒绝额外会话（如 MaxSessions 用尽）时让调用方回退共享会话。
+    """
+    try:
+        sftp = session.client.open_sftp()
+    except Exception:
+        yield None
+        return
+    try:
+        sftp.sock.settimeout(SFTP_STREAM_TIMEOUT)
+        yield sftp
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+
+
 @dataclass
 class UploadSession:
     id: str
@@ -379,6 +404,78 @@ class UploadRegistry:
             item.sftp.remove(item.path)
         except Exception:
             pass
+
+
+@dataclass
+class DownloadTask:
+    id: str
+    session_id: str
+    path: str
+    name: str
+    size: int | None
+    sent: int = 0
+    status: str = "active"  # active | done | error
+    error: str | None = None
+    updated_at: float = 0.0
+
+
+class DownloadRegistry:
+    """Tracks in-flight /api/sftp/download streams for the download center.
+
+    Only browser downloads register here: agent transfers run on their own
+    channel and report through the agent workflow instead.
+    """
+
+    def __init__(self, keep_finished: float = 60.0, max_items: int = 50):
+        self.keep_finished = keep_finished
+        self.max_items = max_items
+        self._items: dict[str, DownloadTask] = {}
+        self._lock = threading.Lock()
+
+    def create(self, session_id: str, path: str, size: int | None) -> DownloadTask:
+        item = DownloadTask(
+            id=secrets.token_urlsafe(12), session_id=session_id, path=path,
+            name=posixpath.basename(path), size=size, updated_at=time.time(),
+        )
+        with self._lock:
+            self._prune()
+            self._items[item.id] = item
+        return item
+
+    def advance(self, item: DownloadTask, count: int) -> None:
+        with self._lock:
+            item.sent += count
+            item.updated_at = time.time()
+
+    def finish(self, item: DownloadTask, error: str | None = None) -> None:
+        with self._lock:
+            if item.status != "active":
+                return
+            item.status = "error" if error else "done"
+            item.error = error
+            item.updated_at = time.time()
+
+    def list(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            self._prune()
+            return [
+                {
+                    "id": item.id, "session_id": item.session_id, "path": item.path,
+                    "name": item.name, "size": item.size, "sent": item.sent,
+                    "status": item.status, "error": item.error,
+                }
+                for item in self._items.values()
+                if session_id is None or item.session_id == session_id
+            ]
+
+    def _prune(self) -> None:
+        now = time.time()
+        for key in [k for k, v in self._items.items() if v.status != "active" and now - v.updated_at >= self.keep_finished]:
+            del self._items[key]
+        overflow = len(self._items) - self.max_items
+        if overflow > 0:
+            for key in [k for k, v in sorted(self._items.items(), key=lambda kv: kv[1].updated_at) if v.status != "active"][:overflow]:
+                del self._items[key]
 
 
 def file_info(attr: paramiko.SFTPAttributes) -> dict[str, Any]:

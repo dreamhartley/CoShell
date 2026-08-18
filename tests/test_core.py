@@ -5,6 +5,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -13,7 +14,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.database import Database
-from app.ssh import HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path, create_ssh_key_pair, normalize_remote_os, parse_private_key, save_ssh_key_pair
+from app.ssh import TRANSFER_PREFETCH_REQUESTS, DownloadRegistry, HostKeyRequired, SSHSession, SessionRegistry, UploadRegistry, VerifiedHostKeyPolicy, clean_remote_path, create_ssh_key_pair, normalize_remote_os, parse_private_key, save_ssh_key_pair
 from app.vault import Vault, VaultError
 from app.agent import AgentCancelled, AgentError, AgentRegistry, QUICK_FIX_SYSTEM_PROMPT, _WebPageParser, _validate_public_url, list_models, model_request_options, normalize_api_base, openai_stream_request, openai_url, stream_chat_message, trim_conversation_history, web_search
 from app.agent_permissions import AgentApprovalRegistry, classify_dangerous_command
@@ -295,7 +296,12 @@ class MemorySftpFile(io.BytesIO):
     def __init__(self, initial=b"", on_close=None):
         super().__init__(initial)
         self.on_close = on_close
+        self.prefetch_args = None
     def set_pipelined(self, _value): pass
+    def stat(self):
+        return SimpleNamespace(st_size=self.getbuffer().nbytes)
+    def prefetch(self, file_size, max_concurrent_requests=None):
+        self.prefetch_args = (file_size, max_concurrent_requests)
     def close(self):
         if self.on_close and not self.closed:
             self.on_close(self.getvalue())
@@ -306,8 +312,11 @@ class MemorySftp:
     def __init__(self):
         self.files = {"/remote/source.bin": b"download-data"}
         self.modes = {}
+        self.closed = False
         # 模拟 paramiko SFTPClient.sock（通道）的超时接口，sftp_timeout 依赖它
         self.sock = SimpleNamespace(timeout=60, gettimeout=lambda: self.sock.timeout, settimeout=lambda value: setattr(self.sock, "timeout", value))
+    def close(self):
+        self.closed = True
     def lstat(self, path):
         if path not in self.files: raise FileNotFoundError(path)
         return self.stat(path)
@@ -349,6 +358,66 @@ def test_sftp_download_route_head_precheck_and_stream(monkeypatch):
     assert missing.status_code == 400
 
 
+def test_sftp_download_route_uses_dedicated_transfer_channel(monkeypatch):
+    shared = MemorySftp()  # 共享会话上没有该文件：若未走专用通道将返回 400
+    dedicated = MemorySftp()
+    dedicated.files = {"/remote/source.bin": b"fast-lane"}
+    dedicated.opened = []
+    builtin_open = dedicated.open
+    def recording_open(path, mode):
+        remote = builtin_open(path, mode)
+        dedicated.opened.append(remote)
+        return remote
+    dedicated.open = recording_open
+    session = SimpleNamespace(
+        sftp=shared, sftp_lock=threading.RLock(),
+        client=SimpleNamespace(open_sftp=lambda: dedicated),
+    )
+    monkeypatch.setattr(main_app.sessions, "get", lambda _session_id: session)
+    client = TestClient(main_app.app)
+
+    stream = client.get("/api/sftp/download?session_id=s-1&path=/remote/source.bin")
+    assert stream.status_code == 200 and stream.content == b"fast-lane"
+    assert len(dedicated.opened) == 1
+    assert dedicated.opened[0].prefetch_args == (9, TRANSFER_PREFETCH_REQUESTS)
+    assert dedicated.closed and dedicated.opened[0].closed
+
+
+def test_sftp_download_reports_progress(monkeypatch):
+    sftp = MemorySftp()
+    sftp.files["/remote/big.bin"] = b"x" * (300 * 1024)
+    monkeypatch.setattr(main_app.sessions, "get", lambda _session_id: SimpleNamespace(sftp=sftp, sftp_lock=threading.RLock()))
+    client = TestClient(main_app.app)
+
+    stream = client.get("/api/sftp/download?session_id=s-1&path=/remote/big.bin")
+    assert stream.status_code == 200 and len(stream.content) == 300 * 1024
+
+    tasks = [t for t in client.get("/api/sftp/downloads").json()["tasks"] if t["name"] == "big.bin"]
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["status"] == "done" and task["size"] == 300 * 1024 and task["sent"] == 300 * 1024
+
+
+def test_download_registry_tracks_and_prunes_finished_tasks():
+    registry = DownloadRegistry(keep_finished=0.2, max_items=4)
+    task = registry.create("s-1", "/remote/a.bin", 100)
+    registry.advance(task, 40)
+    entry = registry.list("s-1")[0]
+    assert entry["sent"] == 40 and entry["status"] == "active" and entry["name"] == "a.bin"
+
+    registry.finish(task, "连接已断开")
+    entry = registry.list("s-1")[0]
+    assert entry["status"] == "error" and entry["error"] == "连接已断开"
+    # 已终结的任务不会被二次改写（finally 里的“已取消”不能覆盖真实结果）
+    registry.finish(task)
+    assert registry.list("s-1")[0]["status"] == "error"
+
+    # 超过保留窗口的完结任务在下一次访问时清理
+    time.sleep(0.21)
+    registry.create("s-2", "/remote/b.bin", 5)
+    assert [item["name"] for item in registry.list()] == ["b.bin"]
+
+
 def test_sftp_chmod_route_applies_mode(monkeypatch):
     sftp = MemorySftp()
     monkeypatch.setattr(main_app.sessions, "get", lambda _session_id: SimpleNamespace(sftp=sftp, sftp_lock=threading.RLock()))
@@ -387,6 +456,30 @@ def test_agent_workspace_is_sandboxed_and_supports_sftp(tmp_path):
     downloaded = workspace.sftp_transfer("ssh-1", "download", "downloads/source.bin", "/remote/source.bin", False)
     assert downloaded["size"] == 13
     assert (tmp_path / "workspace" / "server-7" / "downloads" / "source.bin").read_bytes() == b"download-data"
+
+
+def test_agent_download_prefers_dedicated_channel(tmp_path):
+    shared = MemorySftp()
+    dedicated = MemorySftp()
+    dedicated.files = {"/remote/big.bin": b"via-dedicated-channel"}
+    dedicated.opened = []
+    builtin_open = dedicated.open
+    def recording_open(path, mode):
+        remote = builtin_open(path, mode)
+        dedicated.opened.append(remote)
+        return remote
+    dedicated.open = recording_open
+    session = SimpleNamespace(
+        sftp=shared, server_id=7, host="example.test", port=22, username="root", sftp_lock=threading.RLock(),
+        client=SimpleNamespace(open_sftp=lambda: dedicated),
+    )
+    workspace = AgentWorkspace(tmp_path / "workspace", lambda _session_id: session)
+
+    downloaded = workspace.sftp_transfer("ssh-1", "download", "downloads/big.bin", "/remote/big.bin", False)
+    assert downloaded["size"] == len(b"via-dedicated-channel")
+    assert (tmp_path / "workspace" / "server-7" / "downloads" / "big.bin").read_bytes() == b"via-dedicated-channel"
+    assert dedicated.opened[0].prefetch_args == (len(b"via-dedicated-channel"), TRANSFER_PREFETCH_REQUESTS)
+    assert dedicated.closed
 
 
 def test_agent_workspace_is_isolated_per_server_and_can_be_deleted(tmp_path):

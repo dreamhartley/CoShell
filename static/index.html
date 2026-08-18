@@ -310,6 +310,20 @@
     <p id="agent-history-subtitle" class="agent-history-subtitle">当前服务器的历史会话</p>
     <div id="agent-history-list" class="agent-history-list" role="listbox" aria-label="历史会话列表"></div>
   </dialog>
+  <div id="download-center" class="download-center">
+    <div id="download-panel" class="download-panel" hidden>
+      <div class="download-panel-head">
+        <span class="download-panel-title">文件下载</span>
+        <span id="download-summary" class="download-summary"></span>
+        <button id="download-collapse" class="icon-btn" type="button" aria-label="最小化下载列表" title="最小化">–</button>
+      </div>
+      <div id="download-list" class="download-list"></div>
+    </div>
+    <button id="download-fab" class="download-fab" type="button" hidden aria-label="展开下载列表">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m6.5 10.5 5.5 5.5 5.5-5.5"/><path d="M5 20h14"/></svg>
+      <span id="download-fab-badge" class="download-fab-badge" hidden></span>
+    </button>
+  </div>
   <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
   <script src="/static/vendor/xterm.js"></script>
   <script src="/static/vendor/xterm-addon-fit.js"></script>

@@ -1,7 +1,7 @@
 const $ = (q, root=document) => root.querySelector(q);
 const $$ = (q, root=document) => [...root.querySelectorAll(q)];
 const storedSidebarAgentPermissionMode=sessionStorage.getItem('coshell-sidebar-agent-permission-mode');
-const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, appInfo:null, updateInfo:null, updateChecking:false, sidebarAgentPermissionMode:storedSidebarAgentPermissionMode==='full_access'?'full_access':'request_approval', sidebarAgentPermissionPrompt:false, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}};
+const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, appInfo:null, updateInfo:null, updateChecking:false, sidebarAgentPermissionMode:storedSidebarAgentPermissionMode==='full_access'?'full_access':'request_approval', sidebarAgentPermissionPrompt:false, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, downloadTasks: new Map(), downloadMinimized: false, downloadPollTimer: null, downloadPollUntil: 0, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}};
 
 async function api(path, options={}) {
   const res = await fetch(path, {headers: options.body instanceof FormData ? {} : {'Content-Type':'application/json'}, ...options});
@@ -1098,6 +1098,7 @@ async function legacyDownload(url,name){
   try{
     const head=await fetch(url,{method:'HEAD'});
     if(!head.ok){let msg=head.statusText;try{msg=(await head.json()).detail||msg}catch{}throw new Error(msg)}
+    startDownloadPolling();
     const a=document.createElement('a');a.href=url;a.download=name;a.click();
     toast('已开始下载，文件将保存到浏览器下载目录');
   }catch(err){toast(`下载失败：${err.message}`,true)}
@@ -1114,6 +1115,7 @@ async function saveDownloadWithPicker(url,name){
   try{
     const head=await fetch(url,{method:'HEAD'});
     if(!head.ok){let msg=head.statusText;try{msg=(await head.json()).detail||msg}catch{}throw new Error(msg)}
+    startDownloadPolling();
     toast('正在下载…');
     const response=await fetch(url);
     if(!response.ok){let msg=response.statusText;try{msg=(await response.json()).detail||msg}catch{}throw new Error(msg)}
@@ -1139,6 +1141,63 @@ async function downloadFile(name){
   if(window.showSaveFilePicker)return saveDownloadWithPicker(url,name);
   return legacyDownload(url,name);
 }
+// 下载中心：轮询 /api/sftp/downloads 展示浏览器下载的速度与进度。
+// Agent 的 SFTP 下载不经过该端点，进度只体现在 agent 工作流里。
+function formatTransferSize(n){if(!Number.isFinite(n)||n<=0)return '0 B';const units=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return `${i===0||n>=100?Math.round(n):n.toFixed(1)} ${units[i]}`}
+function startDownloadPolling(){state.downloadPollUntil=Date.now()+5000;if(state.downloadPollTimer)return;state.downloadPollTimer=setInterval(pollDownloadProgress,500);pollDownloadProgress()}
+function stopDownloadPolling(){clearInterval(state.downloadPollTimer);state.downloadPollTimer=null}
+async function pollDownloadProgress(){
+  let snapshotApplied=false;
+  try{const data=await api('/api/sftp/downloads');applyDownloadSnapshot(data.tasks||[]);snapshotApplied=true}catch{}
+  // 刚触发下载时任务可能尚未在后端登记，给一段宽限期；只在成功拿到空快照后才停止轮询
+  if(snapshotApplied&&!state.downloadTasks.size&&Date.now()>=state.downloadPollUntil)stopDownloadPolling();
+}
+function applyDownloadSnapshot(tasks){
+  const now=performance.now(),seen=new Set();
+  for(const raw of tasks){
+    seen.add(raw.id);
+    const task=state.downloadTasks.get(raw.id);
+    if(!task){state.downloadTasks.set(raw.id,{...raw,speed:0,lastSent:raw.sent,lastAt:now});continue}
+    const dt=(now-task.lastAt)/1000;
+    if(raw.status==='active'&&dt>0.2){
+      const rate=Math.max(0,(raw.sent-task.lastSent)/dt);
+      task.speed=task.speed?task.speed*0.6+rate*0.4:rate; // 指数平滑，避免速度数字跳动
+      task.lastSent=raw.sent;task.lastAt=now;
+    }
+    Object.assign(task,raw);
+  }
+  for(const id of [...state.downloadTasks.keys()])if(!seen.has(id))state.downloadTasks.delete(id);
+  renderDownloads();
+}
+function renderDownloads(){
+  const panel=$('#download-panel'),fab=$('#download-fab'),badge=$('#download-fab-badge'),list=$('#download-list'),summary=$('#download-summary');
+  const tasks=[...state.downloadTasks.values()];
+  if(!tasks.length){panel.hidden=true;fab.hidden=true;badge.hidden=true;state.downloadMinimized=false;list.replaceChildren();return}
+  panel.hidden=state.downloadMinimized;
+  fab.hidden=!state.downloadMinimized;
+  const activeTasks=tasks.filter(task=>task.status==='active');
+  fab.classList.toggle('busy',activeTasks.length>0);
+  badge.textContent=activeTasks.length;badge.hidden=activeTasks.length===0;
+  const totalSpeed=activeTasks.reduce((sum,task)=>sum+(task.speed||0),0);
+  summary.textContent=activeTasks.length?`${activeTasks.length} 个进行中 · ${formatTransferSize(totalSpeed)}/s`:'全部完成';
+  list.replaceChildren();
+  for(const task of tasks)list.append(renderDownloadItem(task));
+}
+function renderDownloadItem(task){
+  const row=document.createElement('div');
+  row.className=`download-item ${task.status}`;
+  const percent=task.size?Math.min(100,task.sent*100/task.size):null;
+  if(task.status==='active'&&percent===null)row.classList.add('unknown-size');
+  row.innerHTML=`<img class="file-icon" src="${sftpFileIconPath({name:task.name,is_dir:false})}" alt="" aria-hidden="true" draggable="false"><div class="download-item-info"><div class="download-item-top"><span class="download-item-name" title="${esc(task.name)}">${esc(task.name)}</span><span class="download-item-state"></span></div><div class="download-bar"><i class="download-bar-fill"></i></div><div class="download-item-meta"></div></div>`;
+  $('.download-item-state',row).textContent={active:task.speed>0?`${formatTransferSize(task.speed)}/s`:'连接中…',done:'已完成',error:task.error==='已取消'?'已取消':'失败'}[task.status];
+  const meta=$('.download-item-meta',row);
+  if(task.status==='error'){meta.textContent=task.error||'下载失败';meta.title=task.error||''}
+  else meta.textContent=task.size?`${formatTransferSize(task.sent)} / ${formatTransferSize(task.size)}${percent!==null?` · ${Math.floor(percent)}%`:''}`:formatTransferSize(task.sent);
+  $('.download-bar-fill',row).style.width=percent===null?(task.status==='done'?'100%':'30%'):`${percent}%`;
+  return row;
+}
+$('#download-collapse').onclick=()=>{state.downloadMinimized=true;renderDownloads()};
+$('#download-fab').onclick=()=>{state.downloadMinimized=false;renderDownloads()};
 function renderUploadTask(task){const root=$('#file-list');let row=$(`.upload-row[data-upload-key="${CSS.escape(task.key)}"]`,root);if(!row){$('.empty',root)?.remove();row=document.createElement('div');row.className='file-row upload-row';row.dataset.uploadKey=task.key;row.innerHTML=`<span></span><img class="file-icon" src="${sftpFileIconPath({name:task.file.name,is_dir:false})}" alt="" aria-hidden="true" draggable="false"><span class="file-name"></span><span class="upload-progress"><span class="upload-ring"></span><span class="upload-percent">0%</span></span>`;$('.file-name',row).textContent=task.file.name;root.append(row)}const percent=task.file.size?Math.min(100,Math.round(task.written/task.file.size*100)):100;$('.upload-ring',row).style.setProperty('--progress',`${percent*3.6}deg`);$('.upload-percent',row).textContent=task.status==='error'?'失败':task.status==='finishing'?'校验中':`${percent}%`;row.classList.toggle('upload-error',task.status==='error')}
 async function beginUpload(task,overwrite=false){const tab=state.tabs.find(t=>t.id===task.tabId);if(!tab?.sessionId)throw new Error('SSH 会话已断开');const init=await api('/api/sftp/uploads',{method:'POST',body:JSON.stringify({session_id:tab.sessionId,path:task.directory,filename:task.file.name,size:task.file.size,overwrite})});task.uploadId=init.upload_id;const chunkSize=1024*1024;for(let offset=0;offset<task.file.size;offset+=chunkSize){const chunk=task.file.slice(offset,Math.min(offset+chunkSize,task.file.size));const result=await api(`/api/sftp/uploads/${task.uploadId}?offset=${offset}`,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:chunk});task.written=result.written;renderUploadTask(task)}task.status='finishing';renderUploadTask(task);await api(`/api/sftp/uploads/${task.uploadId}/finish`,{method:'POST'});task.status='done'}
 async function uploadFiles(files) {
