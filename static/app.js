@@ -1172,7 +1172,7 @@ function applyDownloadSnapshot(tasks){
 function renderDownloads(){
   const panel=$('#download-panel'),fab=$('#download-fab'),badge=$('#download-fab-badge'),list=$('#download-list'),summary=$('#download-summary');
   const tasks=[...state.downloadTasks.values()];
-  if(!tasks.length){panel.hidden=true;fab.hidden=true;badge.hidden=true;state.downloadMinimized=false;list.replaceChildren();return}
+  if(!tasks.length){panel.hidden=true;fab.hidden=true;badge.hidden=true;state.downloadMinimized=false;list.replaceChildren();updateToastStackOffset();return}
   panel.hidden=state.downloadMinimized;
   fab.hidden=!state.downloadMinimized;
   const activeTasks=tasks.filter(task=>task.status==='active');
@@ -1182,6 +1182,14 @@ function renderDownloads(){
   summary.textContent=activeTasks.length?`${activeTasks.length} 个进行中 · ${formatTransferSize(totalSpeed)}/s`:'全部完成';
   list.replaceChildren();
   for(const task of tasks)list.append(renderDownloadItem(task));
+  updateToastStackOffset();
+}
+// 下载面板/悬浮图标与提示消息都锚定在右下角，下载中心可见时把提示区域抬到其上方
+function updateToastStackOffset(){
+  const stack=$('#toast-stack');
+  if(!stack)return;
+  const raised=!$('#download-panel').hidden||!$('#download-fab').hidden;
+  stack.style.bottom=raised?`${26+$('#download-center').offsetHeight}px`:'';
 }
 function renderDownloadItem(task){
   const row=document.createElement('div');
