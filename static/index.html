@@ -203,6 +203,15 @@
             <span class="theme-preview theme-preview-midnight"><i></i><i></i><i></i><i></i></span><span class="theme-card-copy"><strong>午夜蓝</strong><small>深海蓝 · 冰川青</small></span><span class="theme-check">✓</span>
           </button>
         </div>
+        <div class="settings-section-title"><strong>终端背景</strong><span class="settings-section-actions"><button id="background-toggle" type="button">设置背景</button></span></div>
+        <input id="background-input" type="file" accept="image/*" hidden>
+        <div class="background-editor">
+          <div id="background-preview" class="background-preview"><span id="background-preview-empty" class="muted">未设置背景</span><div id="background-preview-text" class="background-preview-text hidden"><span class="cmd"><em>›_</em> ssh web@10.0.0.8</span><span class="ok">✓ 已连接 · 负载 0.42</span></div></div>
+          <div class="background-sliders">
+            <label class="background-slider">背景虚化<input id="background-blur" type="range" min="0" max="100" value="30" aria-label="背景虚化程度"><span id="background-blur-value">30%</span></label>
+            <label class="background-slider">蒙版强度<input id="background-mask" type="range" min="0" max="100" value="55" aria-label="主题蒙版强度"><span id="background-mask-value">55%</span></label>
+          </div>
+        </div>
       </section>
       <section id="settings-backup" class="settings-panel">
         <div class="setting-summary"><div><strong>备份应用数据</strong><p class="muted">导出连接、快捷命令、主题、私钥及 Agent/MCP 配置。</p></div></div>
@@ -221,7 +230,7 @@
         <div class="update-about">
           <img class="update-app-icon" src="/assets/app-icon.png" width="132" height="132" alt="CoShell 项目图标">
           <h3>CoShell</h3>
-          <p class="update-version">当前版本 <strong id="update-current-version">0.3.0</strong></p>
+          <p class="update-version">当前版本 <strong id="update-current-version">0.4.0</strong></p>
           <p class="muted">感谢你使用 CoShell。如果你喜欢这个项目，欢迎前往 GitHub 点一个 <span class="update-star-inline">Star ⭐</span></p>
           <div class="update-links">
             <a class="update-external-link" href="https://github.com/dreamhartley/CoShell" target="_blank" rel="noopener noreferrer">GitHub 仓库</a>

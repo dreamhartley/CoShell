@@ -58,6 +58,92 @@ def test_theme_picker_exposes_all_themes_and_removes_quick_toggle():
         assert f':root[data-theme="{theme}"]' in css
 
 
+def test_theme_panel_customizes_terminal_background_with_theme_mask():
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    javascript = Path("static/app.js").read_text(encoding="utf-8")
+    css = Path("static/app.css").read_text(encoding="utf-8")
+
+    theme_panel = html[html.index('id="settings-theme"'):html.index('id="settings-backup"')]
+    for element in (
+        'id="background-toggle"',
+        'id="background-input"',
+        'id="background-preview"',
+        'id="background-preview-empty"',
+        'id="background-preview-text"',
+        'id="background-blur"',
+        'id="background-mask"',
+        'id="background-blur-value"',
+        'id="background-mask-value"',
+    ):
+        assert element in theme_panel
+    assert 'class="background-preview-text hidden"' in theme_panel
+    assert 'ssh web@10.0.0.8' in theme_panel
+    assert '✓ 已连接 · 负载 0.42' in theme_panel
+    assert 'accept="image/*"' in theme_panel
+    assert 'type="range" min="0" max="100"' in theme_panel
+    # 单一切换按钮：无背景时上传，有背景时移除
+    assert 'id="background-upload"' not in html
+    assert 'id="background-remove"' not in html
+    assert ">蒙版强度<" in theme_panel
+    assert "蒙版浓度" not in html
+    assert "图片仅铺满终端区域" not in html
+    assert 'aria-label="主题蒙版强度"' in theme_panel
+
+    assert "allowTransparency:true" in javascript
+    assert "theme:terminalThemeFor(currentTheme())" in javascript
+    assert "t.term.options.theme=terminalThemeFor(theme)" in javascript
+    assert "terminal_background_blur" in javascript
+    assert "terminal_background_mask" in javascript
+    assert "restoreTerminalBackground()" in javascript
+    assert "readBackgroundImageFile(file)" in javascript
+    assert "toDataURL('image/jpeg',0.86)" in javascript
+    assert "classList.toggle('has-background',active)" in javascript
+    assert "await Promise.all([restoreTheme(),restoreTerminalBackground()])" in javascript
+    assert "$('#background-toggle').textContent=background.image?'移除背景':'设置背景'" in javascript
+    assert "state.terminalBackground.image?removeTerminalBackground():$('#background-input').click()" in javascript
+    assert "$('#background-preview-text').classList.toggle('hidden',!background.image)" in javascript
+
+    assert ".terminals.has-background::before,.terminals.has-background::after{display:block}" in css
+    assert "filter:blur(var(--terminal-bg-blur,0px))" in css
+    assert ".terminals::after{inset:0;background:var(--terminal);opacity:var(--terminal-bg-mask,.55)}" in css
+    assert ".terminals.has-background .terminal-host,.terminals.has-background .welcome{z-index:1}" in css
+    assert ".background-editor{display:flex;align-items:center" in css
+    assert ".background-preview{position:relative;display:grid;width:157px;height:118px;flex:none" in css
+    # 覆盖 .dialog-form label 的竖排样式，保证滑块行横向排列并与预览框居中对齐
+    assert ".background-editor .background-slider{display:grid;grid-template-columns:56px minmax(0,1fr) 40px" in css
+    assert ".background-editor .background-slider input{width:100%;height:17px;padding:0;border:0;background:transparent" in css
+    assert ".background-editor .background-sliders{display:flex;min-width:0;flex:1;flex-direction:column" in css
+    assert ".background-preview-text{position:absolute;z-index:1;top:7px;left:8px" in css
+    assert 'font:9.5px/1.45 ui-monospace' in css
+    assert ".background-preview-text .cmd em{font-style:normal;color:var(--accent)}" in css
+
+
+def test_terminal_background_helpers_clamp_and_map_slider_values():
+    source = Path("static/app.js").read_text(encoding="utf-8")
+    helpers = source[source.index("function backgroundPercent"):source.index("function applyTerminalBackground")]
+    context = quickjs.Context()
+    result = context.eval(
+        "const state={terminalBackground:{image:null}};"
+        "const terminalThemes={ocean:{background:'#f4f9fa'},dark:{background:'#1d1325'}};"
+        + helpers
+        + """
+        JSON.stringify({
+          percents:[backgroundPercent(null,30),backgroundPercent('',55),backgroundPercent('42',30),
+                    backgroundPercent(120,30),backgroundPercent(-3,30),backgroundPercent('abc',55)],
+          blur:[terminalBackgroundBlurPx(0),terminalBackgroundBlurPx(50),terminalBackgroundBlurPx(100),terminalBackgroundBlurPx(null)],
+          themeTransparent:(state.terminalBackground.image='data:image/jpeg;base64,x',terminalThemeFor('ocean').background),
+          themeSolid:(state.terminalBackground.image=null,terminalThemeFor('dark').background)
+        })
+        """
+    )
+    assert result == (
+        '{"percents":[30,55,42,30,30,55],'
+        '"blur":["0px","12px","24px","7.2px"],'
+        '"themeTransparent":"rgba(0,0,0,0)",'
+        '"themeSolid":"#1d1325"}'
+    )
+
+
 def test_settings_vault_merges_lock_unlock_into_summary_button():
     html = Path("static/index.html").read_text(encoding="utf-8")
     javascript = Path("static/app.js").read_text(encoding="utf-8")
@@ -97,7 +183,7 @@ def test_settings_exposes_release_update_and_thanks_page():
     assert 'data-settings-panel="update"' in html
     assert 'id="settings-update"' in html
     assert 'src="/assets/app-icon.png"' in html
-    assert 'id="update-current-version">0.3.0' in html
+    assert 'id="update-current-version">0.4.0' in html
     assert "https://github.com/dreamhartley/CoShell" in html
     assert "感谢你使用 CoShell。如果你喜欢这个项目，欢迎前往 GitHub 点一个" in html
     assert '<span class="update-star-inline">Star ⭐</span>' in html

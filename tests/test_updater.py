@@ -26,19 +26,19 @@ def test_version_comparison_accepts_github_v_tags():
 
 def test_latest_release_selects_packaged_windows_zip(monkeypatch):
     document = {
-        "tag_name": "v0.4.0",
-        "name": "CoShell 0.4.0",
-        "html_url": "https://github.com/dreamhartley/CoShell/releases/tag/v0.4.0",
+        "tag_name": "v0.4.1",
+        "name": "CoShell 0.4.1",
+        "html_url": "https://github.com/dreamhartley/CoShell/releases/tag/v0.4.1",
         "published_at": "2026-07-24T12:00:00Z",
         "assets": [
             {
                 "name": "checksums.txt",
-                "browser_download_url": "https://github.com/dreamhartley/CoShell/releases/download/v0.4.0/checksums.txt",
+                "browser_download_url": "https://github.com/dreamhartley/CoShell/releases/download/v0.4.1/checksums.txt",
                 "size": 100,
             },
             {
-                "name": "CoShell-v0.4.0-windows-x64-portable.zip",
-                "browser_download_url": "https://github.com/dreamhartley/CoShell/releases/download/v0.4.0/CoShell.zip",
+                "name": "CoShell-v0.4.1-windows-x64-portable.zip",
+                "browser_download_url": "https://github.com/dreamhartley/CoShell/releases/download/v0.4.1/CoShell.zip",
                 "size": 1234,
                 "digest": "sha256:abcd",
             },
@@ -52,9 +52,9 @@ def test_latest_release_selects_packaged_windows_zip(monkeypatch):
 
     release = updater.fetch_latest_release()
 
-    assert release.version == "0.4.0"
+    assert release.version == "0.4.1"
     assert release.asset is not None
-    assert release.asset.name == "CoShell-v0.4.0-windows-x64-portable.zip"
+    assert release.asset.name == "CoShell-v0.4.1-windows-x64-portable.zip"
     assert updater.public_release_status(release)["update_available"] is True
 
 

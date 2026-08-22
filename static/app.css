@@ -159,3 +159,25 @@ dialog::backdrop{background:#1b10238f;backdrop-filter:blur(4px)}
 .agent-history-delete::before{content:"";width:14px;height:14px;background:currentColor;mask:url("/static/icons/trash.svg") center/contain no-repeat;-webkit-mask:url("/static/icons/trash.svg") center/contain no-repeat}
 .agent-history-delete:hover{background:color-mix(in srgb,var(--danger) 14%,transparent);color:var(--danger)}
 .agent-history-empty{padding:26px 10px;color:var(--muted);text-align:center}
+
+/* --- 终端自定义背景：图片层 + 主题色蒙版，文字层保持在上 --- */
+.terminals::before,.terminals::after{content:"";position:absolute;display:none;pointer-events:none;z-index:0}
+.terminals::before{inset:calc(-12px - var(--terminal-bg-blur,0px));background:var(--terminal-bg-image,none) center/cover no-repeat;filter:blur(var(--terminal-bg-blur,0px))}
+.terminals::after{inset:0;background:var(--terminal);opacity:var(--terminal-bg-mask,.55)}
+.terminals.has-background::before,.terminals.has-background::after{display:block}
+.terminals.has-background .terminal-host,.terminals.has-background .welcome{z-index:1}
+.background-editor{display:flex;align-items:center;gap:13px}
+.background-preview{position:relative;display:grid;width:157px;height:118px;flex:none;overflow:hidden;place-items:center;border:1px solid var(--border);border-radius:9px;background:var(--terminal)}
+.background-preview::before{content:"";position:absolute;inset:calc(-12px - var(--terminal-bg-blur,0px));background:var(--terminal-bg-image,none) center/cover no-repeat;filter:blur(var(--terminal-bg-blur,0px))}
+.background-preview::after{content:"";position:absolute;inset:0;background:var(--terminal);opacity:var(--terminal-bg-mask,.55)}
+.background-preview:not(.has-image)::before,.background-preview:not(.has-image)::after{display:none}
+.background-preview span{position:relative;z-index:1;font-size:12px}
+.background-preview-text{position:absolute;z-index:1;top:7px;left:8px;right:8px;display:flex;min-width:0;flex-direction:column;gap:2px;font:9.5px/1.45 ui-monospace,"Cascadia Mono",Consolas,monospace;text-align:left;white-space:nowrap}
+.background-preview-text span{position:static;font-size:inherit;overflow:hidden;text-overflow:ellipsis}
+.background-preview-text .cmd{color:var(--text)}
+.background-preview-text .cmd em{font-style:normal;color:var(--accent)}
+.background-preview-text .ok{color:var(--good)}
+.background-editor .background-sliders{display:flex;min-width:0;flex:1;flex-direction:column;gap:14px}
+.background-editor .background-slider{display:grid;grid-template-columns:56px minmax(0,1fr) 40px;align-items:center;gap:10px;margin:0;color:var(--muted)}
+.background-editor .background-slider input{width:100%;height:17px;padding:0;border:0;background:transparent;accent-color:var(--accent)}
+.background-editor .background-slider span{font-size:12px;font-variant-numeric:tabular-nums;text-align:right}

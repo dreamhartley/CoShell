@@ -1,7 +1,7 @@
 const $ = (q, root=document) => root.querySelector(q);
 const $$ = (q, root=document) => [...root.querySelectorAll(q)];
 const storedSidebarAgentPermissionMode=sessionStorage.getItem('coshell-sidebar-agent-permission-mode');
-const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, appInfo:null, updateInfo:null, updateChecking:false, sidebarAgentPermissionMode:storedSidebarAgentPermissionMode==='full_access'?'full_access':'request_approval', sidebarAgentPermissionPrompt:false, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, downloadTasks: new Map(), downloadMinimized: false, downloadPollTimer: null, downloadPollUntil: 0, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}};
+const state = {tabs: [], activeId: null, servers: [], shortcuts: [], sshKeys:[], mcpServers:[], vault: null, agentSettings:null, appInfo:null, updateInfo:null, updateChecking:false, sidebarAgentPermissionMode:storedSidebarAgentPermissionMode==='full_access'?'full_access':'request_approval', sidebarAgentPermissionPrompt:false, selectedFiles: new Set(), uploadTasks: new Map(), remoteClipboard: null, pendingReconnect:null, downloadTasks: new Map(), downloadMinimized: false, downloadPollTimer: null, downloadPollUntil: 0, editor: {cm:null,sessionId:null,path:null,mtime:null,dirty:false,saving:false}, terminalBackground: {image:null,blur:30,mask:55}};
 
 async function api(path, options={}) {
   const res = await fetch(path, {headers: options.body instanceof FormData ? {} : {'Content-Type':'application/json'}, ...options});
@@ -460,12 +460,94 @@ function applyTheme(theme, persist=true){
   document.documentElement.dataset.theme=theme;
   document.documentElement.dataset.themeMode=themeModes[theme];
   $$('.theme-card').forEach(card=>{const selected=card.dataset.themeChoice===theme;card.classList.toggle('selected',selected);card.setAttribute('aria-pressed',String(selected))});
-  state.tabs.forEach(t=>{if(t.term)t.term.options.theme=terminalThemes[theme]});
+  state.tabs.forEach(t=>{if(t.term)t.term.options.theme=terminalThemeFor(theme)});
   if(state.editor.cm)state.editor.cm.setOption('theme',themeModes[theme]==='dark'?'material-darker':'default');
   if(persist){ localStorage.setItem('webssh-theme',theme); api('/api/settings/theme',{method:'PUT',body:JSON.stringify({value:theme})}).catch(()=>{}); }
 }
 async function restoreTheme(){
   try{const saved=await api('/api/settings/theme');if(terminalThemes[saved.value])applyTheme(saved.value,false)}catch{}
+}
+
+const TERMINAL_BACKGROUND_KEYS={image:'terminal_background',blur:'terminal_background_blur',mask:'terminal_background_mask'};
+const TERMINAL_BACKGROUND_LIMIT=6*1024*1024;
+function backgroundPercent(raw,fallback){const value=Number(raw);return raw==null||raw===''||!Number.isFinite(value)||value<0||value>100?fallback:Math.round(value)}
+function terminalBackgroundBlurPx(percent){return `${Math.round(backgroundPercent(percent,30)*0.24*10)/10}px`}
+function terminalThemeFor(theme){
+  const base=terminalThemes[theme]||terminalThemes.dark;
+  return state.terminalBackground.image?{...base,background:'rgba(0,0,0,0)'}:base;
+}
+function applyTerminalBackground(partial={}){
+  const background=state.terminalBackground={...state.terminalBackground,...partial};
+  const root=document.documentElement,active=!!background.image;
+  $('#terminals').classList.toggle('has-background',active);
+  root.style.setProperty('--terminal-bg-image',active?`url("${background.image}")`:'none');
+  root.style.setProperty('--terminal-bg-blur',terminalBackgroundBlurPx(background.blur));
+  root.style.setProperty('--terminal-bg-mask',String(backgroundPercent(background.mask,55)/100));
+  state.tabs.forEach(t=>{if(t.term)t.term.options.theme=terminalThemeFor(currentTheme())});
+  syncTerminalBackgroundControls();
+}
+function syncTerminalBackgroundControls(){
+  const background=state.terminalBackground;
+  $('#background-blur').value=background.blur;
+  $('#background-mask').value=background.mask;
+  $('#background-blur-value').textContent=`${background.blur}%`;
+  $('#background-mask-value').textContent=`${background.mask}%`;
+  $('#background-toggle').textContent=background.image?'移除背景':'设置背景';
+  $('#background-preview').classList.toggle('has-image',!!background.image);
+  $('#background-preview-empty').classList.toggle('hidden',!!background.image);
+  $('#background-preview-text').classList.toggle('hidden',!background.image);
+}
+function saveTerminalBackgroundSetting(key,value){api(`/api/settings/${key}`,{method:'PUT',body:JSON.stringify({value})}).catch(()=>{})}
+function readBackgroundImageFile(file){
+  return new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file),image=new Image();
+    image.onload=()=>{
+      try{
+        const scale=Math.min(1,2560/Math.max(image.naturalWidth||1,image.naturalHeight||1));
+        const canvas=document.createElement('canvas');
+        canvas.width=Math.max(1,Math.round((image.naturalWidth||1)*scale));
+        canvas.height=Math.max(1,Math.round((image.naturalHeight||1)*scale));
+        const ctx=canvas.getContext('2d');
+        ctx.fillStyle='#fff';ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.drawImage(image,0,0,canvas.width,canvas.height);
+        const dataUrl=canvas.toDataURL('image/jpeg',0.86);
+        if(dataUrl.length>TERMINAL_BACKGROUND_LIMIT)throw new Error('图片压缩后仍超过 6MB，请换一张更小的图片');
+        URL.revokeObjectURL(url);resolve(dataUrl);
+      }catch(err){URL.revokeObjectURL(url);reject(err)}
+    };
+    image.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('无法读取所选图片'))};
+    image.src=url;
+  });
+}
+async function removeTerminalBackground(){
+  if(!await themedConfirm('移除终端背景图片，恢复主题默认背景？',{title:'移除终端背景',confirmText:'移除'}))return;
+  try{
+    await api(`/api/settings/${TERMINAL_BACKGROUND_KEYS.image}`,{method:'PUT',body:JSON.stringify({value:''})});
+    applyTerminalBackground({image:null});
+    toast('已恢复默认背景');
+  }catch(err){toast(err.message,true)}
+}
+$('#background-toggle').onclick=()=>state.terminalBackground.image?removeTerminalBackground():$('#background-input').click();
+$('#background-input').onchange=async e=>{
+  const file=e.target.files&&e.target.files[0];e.target.value='';
+  if(!file)return;
+  if(!file.type.startsWith('image/'))return toast('请选择图片文件',true);
+  try{
+    const image=await readBackgroundImageFile(file);
+    await api(`/api/settings/${TERMINAL_BACKGROUND_KEYS.image}`,{method:'PUT',body:JSON.stringify({value:image})});
+    applyTerminalBackground({image});
+    toast('终端背景已更新');
+  }catch(err){toast(err.message,true)}
+};
+$('#background-blur').oninput=e=>applyTerminalBackground({blur:Number(e.target.value)});
+$('#background-blur').onchange=e=>saveTerminalBackgroundSetting(TERMINAL_BACKGROUND_KEYS.blur,Number(e.target.value));
+$('#background-mask').oninput=e=>applyTerminalBackground({mask:Number(e.target.value)});
+$('#background-mask').onchange=e=>saveTerminalBackgroundSetting(TERMINAL_BACKGROUND_KEYS.mask,Number(e.target.value));
+async function restoreTerminalBackground(){
+  try{
+    const [image,blur,mask]=await Promise.all([api(`/api/settings/${TERMINAL_BACKGROUND_KEYS.image}`),api(`/api/settings/${TERMINAL_BACKGROUND_KEYS.blur}`),api(`/api/settings/${TERMINAL_BACKGROUND_KEYS.mask}`)]);
+    applyTerminalBackground({image:image.value&&String(image.value).startsWith('data:image/')?image.value:null,blur:backgroundPercent(blur.value,30),mask:backgroundPercent(mask.value,55)});
+  }catch{}
 }
 
 async function refreshStatus(){
@@ -487,7 +569,7 @@ function desktopUpdateBridge(waitMs=0){
 function updateErrorMessage(error){return error?.message||String(error||'未知错误')}
 function renderUpdateInfo(info=state.updateInfo||state.appInfo){
   if(!info)return;
-  $('#update-current-version').textContent=info.current_version||'0.3.0';
+  $('#update-current-version').textContent=info.current_version||'0.4.0';
   const card=$('#update-status-card'),title=$('#update-status-title'),install=$('#update-install'),releaseLink=$('#update-release-link');
   card.classList.remove('good','available','error');
   install.classList.toggle('hidden',!(info.update_available&&info.can_install));
@@ -627,7 +709,7 @@ $$('.dialog-close').forEach(x=>x.addEventListener('click',()=>x.closest('dialog'
 function newTerminal(tabData={}){
   const id=tabData.id||uid(); if(state.tabs.some(t=>t.id===id))return;
   const host=document.createElement('div'); host.className='terminal-host'; host.dataset.id=id; $('#terminals').append(host);
-  const term=new Terminal({cursorBlink:true,fontSize:14,fontFamily:'Cascadia Mono, Sarasa Mono SC, Noto Sans Mono CJK SC, Microsoft YaHei UI, Consolas, monospace',letterSpacing:0,lineHeight:1.08,scrollback:6000,theme:terminalThemes[currentTheme()],allowProposedApi:true});
+  const term=new Terminal({cursorBlink:true,fontSize:14,fontFamily:'Cascadia Mono, Sarasa Mono SC, Noto Sans Mono CJK SC, Microsoft YaHei UI, Consolas, monospace',letterSpacing:0,lineHeight:1.08,scrollback:6000,theme:terminalThemeFor(currentTheme()),allowProposedApi:true,allowTransparency:true});
   const fit=new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
   const tab={id,title:tabData.title||'新终端',server_id:tabData.server_id??null,last_path:tabData.last_path||'.',position:state.tabs.length,status:'idle',term,fit,host,ws:null,sessionId:null,localInput:'',localPromptShown:false,typedLine:'',lastCommand:'',lastCommandStart:null,agentBuffer:null,agentAutocomplete:null,agentAutocompleteOpen:false,agentAutocompleteIndex:0,agentBusy:false,agentBusyNotice:false,agentAbortController:null,agentPendingContext:null,agentApproval:null,agentChat:[],agentChatId:null,agentActivity:null,agentStreamingMessage:null,agentProcess:null,agentProcessTimer:null,quickAgentBusy:false,quickAgentAbort:null,quickAgentApproval:null,quickApprovalBuffer:'',quickAgentPermissionMode:'request_approval',quickIncidentCommandStart:null};
   createTerminalAgentAutocomplete(tab);
@@ -1258,5 +1340,5 @@ $('#sidebar-toggle').onclick=()=>{$('#sidebar').classList.toggle('collapsed');sc
 window.addEventListener('resize',()=>scheduleTerminalFit(activeTab()));
 new ResizeObserver(()=>fitTerminal(activeTab())).observe($('#terminals'));
 
-async function init(){applyTheme(currentTheme(),false);await restoreTheme();await Promise.all([refreshStatus(),loadApplicationInfo()]);await autoUnlockVault();await Promise.all([loadServers(),loadShortcuts(),loadSSHKeys()]);const tabs=await api('/api/tabs');tabs.forEach(data=>{const tab=newTerminal(data);if(tab)showReconnectPrompt(tab)});if(!tabs.length)activateTab(null);else activateTab(tabs[0].id);if(state.appInfo?.packaged)checkForUpdates(false)}
+async function init(){applyTheme(currentTheme(),false);await Promise.all([restoreTheme(),restoreTerminalBackground()]);await Promise.all([refreshStatus(),loadApplicationInfo()]);await autoUnlockVault();await Promise.all([loadServers(),loadShortcuts(),loadSSHKeys()]);const tabs=await api('/api/tabs');tabs.forEach(data=>{const tab=newTerminal(data);if(tab)showReconnectPrompt(tab)});if(!tabs.length)activateTab(null);else activateTab(tabs[0].id);if(state.appInfo?.packaged)checkForUpdates(false)}
 init().catch(err=>toast(err.message,true));
